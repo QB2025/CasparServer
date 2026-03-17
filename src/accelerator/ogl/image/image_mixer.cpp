@@ -94,11 +94,13 @@ class image_renderer
                 {array<const std::uint8_t>(buffer.data(), format_desc.size, true), nullptr});
         }
 
-        auto f = std::move(
-            ogl_->dispatch_async([=, layers = std::move(layers)]() mutable
-                                 -> std::tuple<std::future<array<const std::uint8_t>>, std::shared_ptr<core::texture>> {
+        auto f = std::move(ogl_->dispatch_async(
+            [=, layers = std::move(layers)]() mutable
+                -> std::tuple<std::future<array<const std::uint8_t>>, std::shared_ptr<core::texture>> {
                 auto target_texture = ogl_->create_texture(format_desc.width, format_desc.height, 4, depth_);
                 draw(target_texture, std::move(layers), format_desc);
+                // TODO QB:
+                //  DRAW with flag straight_alpha_output
                 return {ogl_->copy_async(target_texture), target_texture};
             }));
 

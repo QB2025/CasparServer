@@ -43,6 +43,8 @@ uniform float		chroma_softness;
 uniform float		chroma_spill_suppress;
 uniform float		chroma_spill_suppress_saturation;
 
+// TODO QB: add new uniform straight_alpha_output and implement unmultiply function if set to true. 
+
 /*
 ** Contrast, saturation, brightness
 ** Code of this function is from TGM's shader pack

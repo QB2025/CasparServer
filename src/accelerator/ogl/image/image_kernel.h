@@ -42,6 +42,7 @@ enum class keyer
     additive,
 };
 
+// TODO QB: add boolean flag straight_alpha_output
 struct draw_params final
 {
     core::pixel_format_desc                     pix_desc = core::pixel_format_desc(core::pixel_format::invalid);
