@@ -15,6 +15,7 @@ Starting with CasparCG 2.6, this will become a requirement
 * Rework linux builds to produce ubuntu deb files
 * Update ffmpeg to 7.0
 * Reimplement mixer transforms, to handle routes correctly
+* Mixer: Add global configuration key `mixer.straight_alpha_output` for a final GPU straight-alpha output pass
 * Support more pixel formats from ffmpeg, to preserve colour accuracy better
 * Support running on headless linux
 * Transitions: Additional behaviours

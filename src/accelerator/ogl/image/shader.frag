@@ -9,6 +9,7 @@ uniform sampler2D	local_key;
 uniform sampler2D	layer_key;
 
 uniform bool        is_straight_alpha;
+uniform bool        straight_alpha_output;
 
 uniform mat3		color_matrix;
 uniform vec3		luma_coeff;
@@ -42,8 +43,6 @@ uniform float		chroma_min_brightness;
 uniform float		chroma_softness;
 uniform float		chroma_spill_suppress;
 uniform float		chroma_spill_suppress_saturation;
-
-// TODO QB: add new uniform straight_alpha_output and implement unmultiply function if set to true. 
 
 /*
 ** Contrast, saturation, brightness
@@ -541,5 +540,11 @@ void main()
         color = 1.0 - color;
     if (blend_mode >= 0)
         color = blend(color);
+    if (straight_alpha_output) {
+        if (color.a > 0.0000001)
+            color.rgb /= color.a;
+        else
+            color.rgb = vec3(0.0);
+    }
     fragColor = color.bgra;
 }

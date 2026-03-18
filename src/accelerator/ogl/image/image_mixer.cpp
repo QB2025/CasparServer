@@ -32,6 +32,7 @@
 #include <common/bit_depth.h>
 #include <common/future.h>
 #include <common/log.h>
+#include <common/env.h>
 
 #include <core/frame/frame.h>
 #include <core/frame/frame_transform.h>
@@ -74,13 +75,18 @@ class image_renderer
     image_kernel            kernel_;
     const size_t            max_frame_size_;
     common::bit_depth       depth_;
+    bool                    straight_alpha_output_;
 
   public:
-    explicit image_renderer(const spl::shared_ptr<device>& ogl, const size_t max_frame_size, common::bit_depth depth)
+    explicit image_renderer(const spl::shared_ptr<device>& ogl,
+                            const size_t                  max_frame_size,
+                            common::bit_depth             depth,
+                            bool                          straight_alpha_output)
         : ogl_(ogl)
         , kernel_(ogl_)
         , max_frame_size_(max_frame_size)
         , depth_(depth)
+        , straight_alpha_output_(straight_alpha_output)
     {
     }
 
@@ -98,9 +104,19 @@ class image_renderer
             [=, layers = std::move(layers)]() mutable
                 -> std::tuple<std::future<array<const std::uint8_t>>, std::shared_ptr<core::texture>> {
                 auto target_texture = ogl_->create_texture(format_desc.width, format_desc.height, 4, depth_);
-                draw(target_texture, std::move(layers), format_desc);
-                // TODO QB:
-                //  DRAW with flag straight_alpha_output
+
+                if (straight_alpha_output_) {
+                    auto composited_texture = ogl_->create_texture(format_desc.width, format_desc.height, 4, depth_);
+                    draw(composited_texture, std::move(layers), format_desc);
+                    draw(target_texture,
+                         std::move(composited_texture),
+                         format_desc,
+                         core::blend_mode::normal,
+                         true);
+                } else {
+                    draw(target_texture, std::move(layers), format_desc);
+                }
+
                 return {ogl_->copy_async(target_texture), target_texture};
             }));
 
@@ -228,7 +244,8 @@ class image_renderer
     void draw(std::shared_ptr<texture>&  target_texture,
               std::shared_ptr<texture>&& source_texture,
               core::video_format_desc    format_desc,
-              core::blend_mode           blend_mode = core::blend_mode::normal)
+              core::blend_mode           blend_mode             = core::blend_mode::normal,
+              bool                       straight_alpha_output = false)
     {
         if (!source_texture)
             return;
@@ -242,7 +259,8 @@ class image_renderer
         draw_params.textures        = {spl::make_shared_ptr(source_texture)};
         draw_params.blend_mode      = blend_mode;
         draw_params.background      = target_texture;
-        draw_params.geometry        = core::frame_geometry::get_default();
+        draw_params.geometry              = core::frame_geometry::get_default();
+        draw_params.straight_alpha_output = straight_alpha_output;
 
         kernel_.draw(std::move(draw_params));
     }
@@ -263,7 +281,10 @@ struct image_mixer::impl
   public:
     impl(const spl::shared_ptr<device>& ogl, const int channel_id, const size_t max_frame_size, common::bit_depth depth)
         : ogl_(ogl)
-        , renderer_(ogl, max_frame_size, depth)
+        , renderer_(ogl,
+                    max_frame_size,
+                    depth,
+                    env::properties().get(L"configuration.mixer.straight_alpha_output", false))
         , transform_stack_(1)
     {
         CASPAR_LOG(info) << L"Initialized OpenGL Accelerated GPU Image Mixer for channel " << channel_id;
