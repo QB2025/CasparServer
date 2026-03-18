@@ -27,6 +27,7 @@
 #include "../util/texture.h"
 
 #include <boost/align/aligned_allocator.hpp>
+#include <boost/property_tree/ptree.hpp>
 
 #include <common/array.h>
 #include <common/bit_depth.h>
