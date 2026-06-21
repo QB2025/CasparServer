@@ -45,10 +45,6 @@
 #include <boost/algorithm/string.hpp>
 #include <boost/range/adaptor/transformed.hpp>
 
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4244)
-#endif
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavfilter/avfilter.h>
@@ -61,9 +57,6 @@ extern "C" {
 #include <libavutil/samplefmt.h>
 #include <libavutil/timecode.h>
 }
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
 
 #include <boost/format.hpp>
 
@@ -223,22 +216,11 @@ struct Filter
             FF(avfilter_graph_create_filter(
                 &sink, avfilter_get_by_name("buffersink"), "out", nullptr, nullptr, graph.get()));
 
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4245)
-#endif
             AVPixelFormat pix_fmts[] = {pix_fmt, AV_PIX_FMT_NONE};
             FF(av_opt_set_int_list(sink, "pix_fmts", pix_fmts, -1, AV_OPT_SEARCH_CHILDREN));
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
         } else if (type == AVMEDIA_TYPE_AUDIO) {
             FF(avfilter_graph_create_filter(
                 &sink, avfilter_get_by_name("abuffersink"), "out", nullptr, nullptr, graph.get()));
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4245)
-#endif
 
             AVSampleFormat sample_fmts[]  = {AV_SAMPLE_FMT_S32, AV_SAMPLE_FMT_NONE};
             int            sample_rates[] = {format_desc.audio_sample_rate, 0};
@@ -256,9 +238,6 @@ struct Filter
             av_channel_layout_uninit(&channel_layout);
              */
 
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
         } else {
             CASPAR_THROW_EXCEPTION(ffmpeg_error_t()
                                    << boost::errinfo_errno(EINVAL) << msg_info_t("invalid output media type"));
@@ -912,7 +891,7 @@ class decklink_producer_proxy : public core::frame_producer
         , executor_(L"decklink_producer[" + std::to_wstring(device_index) + L"]")
     {
         auto ctx = core::diagnostics::call_context::for_thread();
-        executor_.invoke([=] {
+        executor_.invoke([=, this] {
             core::diagnostics::call_context::for_thread() = ctx;
             com_initialize();
             producer_.reset(new decklink_producer(format_desc,
@@ -929,7 +908,7 @@ class decklink_producer_proxy : public core::frame_producer
 
     ~decklink_producer_proxy() override
     {
-        executor_.invoke([=] {
+        executor_.invoke([this] {
             producer_.reset();
             com_uninitialize();
         });

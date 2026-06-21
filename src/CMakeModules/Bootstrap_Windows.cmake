@@ -12,6 +12,7 @@ if(POLICY CMP0167)
 endif()
 
 set(BOOST_USE_PRECOMPILED ON CACHE BOOL "Use precompiled boost")
+set(ENABLE_VULKAN OFF CACHE BOOL "Enable Vulkan support")
 
 set(CASPARCG_RUNTIME_DEPENDENCIES_RELEASE "" CACHE INTERNAL "")
 set(CASPARCG_RUNTIME_DEPENDENCIES_DEBUG "" CACHE INTERNAL "")
@@ -106,6 +107,7 @@ casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avdevice-61.dll")
 casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avfilter-10.dll")
 casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avformat-61.dll")
 casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avutil-59.dll")
+casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/postproc-58.dll")
 casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/swresample-5.dll")
 casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/swscale-8.dll")
 # for scanner:
@@ -149,6 +151,24 @@ target_include_directories(GLEW::glew INTERFACE ${glew_SOURCE_DIR}/include)
 target_link_directories(GLEW::glew INTERFACE ${glew_SOURCE_DIR}/lib/Release/x64)
 target_link_libraries(GLEW::glew INTERFACE glew32)
 casparcg_add_runtime_dependency("${glew_SOURCE_DIR}/bin/Release/x64/glew32.dll")
+
+IF(ENABLE_VULKAN)
+	find_package(Vulkan REQUIRED)
+
+	FetchContent_Declare(vk_bootstrap
+			URL ${CASPARCG_DOWNLOAD_MIRROR}/vk-bootstrap/vk-bootstrap-1.4.328.zip
+			URL_HASH SHA256=10f257c30a0a49d30b28a72cf3a7942d93a61f977adaa04bee29304c6506dc12
+			DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
+			)
+	FetchContent_MakeAvailable(vk_bootstrap)
+
+	FetchContent_Declare(vma
+			URL ${CASPARCG_DOWNLOAD_MIRROR}/VulkanMemoryAllocator/VulkanMemoryAllocator-3.3.0.zip
+			URL_HASH SHA256=81755d8fcb411b97292c6682e828501315db319374c7c34ba6e1226452c6c392
+			DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
+	)
+	FetchContent_MakeAvailable(vma)
+ENDIF()
 
 # SFML
 FetchContent_Declare(sfml
@@ -281,4 +301,4 @@ string(REPLACE "/EHsc" "" CMAKE_CXX_FLAGS ${CMAKE_CXX_FLAGS})
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHa /Zi /W4 /WX /MP /fp:fast /Zm192 /FIcommon/compiler/vs/disable_silly_warnings.h")
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG}	/D TBB_USE_ASSERT=1 /D TBB_USE_DEBUG /bigobj")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}	/Oi /arch:AVX2 /Ot /Gy /bigobj")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE}	/Oi /arch:AVX /Ot /Gy /bigobj")
