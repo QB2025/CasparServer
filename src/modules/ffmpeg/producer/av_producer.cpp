@@ -26,10 +26,6 @@
 #include <core/frame/frame_factory.h>
 #include <core/monitor/monitor.h>
 
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4244)
-#endif
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavfilter/avfilter.h>
@@ -43,9 +39,6 @@ extern "C" {
 #include <libavutil/pixfmt.h>
 #include <libavutil/samplefmt.h>
 }
-#ifdef _MSC_VER
-#pragma warning(pop)
-#endif
 
 #include <algorithm>
 #include <atomic>
@@ -186,7 +179,7 @@ class Decoder
 
         FF(avcodec_open2(ctx.get(), codec, nullptr));
 
-        thread = boost::thread([=]() {
+        thread = boost::thread([this]() {
             try {
                 while (!thread.interruption_requested()) {
                     auto av_frame = alloc_frame();
@@ -559,10 +552,6 @@ struct Filter
         if (media_type == AVMEDIA_TYPE_VIDEO) {
             sink = FFMEM(avfilter_graph_alloc_filter(graph.get(), avfilter_get_by_name("buffersink"), "out"));
 
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4245)
-#endif
             const AVPixelFormat pix_fmts[] = {AV_PIX_FMT_RGB24,
                                               AV_PIX_FMT_BGR24,
                                               AV_PIX_FMT_BGRA,
@@ -592,40 +581,42 @@ struct Filter
                                               AV_PIX_FMT_GBRAP16,
                                               AV_PIX_FMT_NONE};
 #if LIBAVUTIL_VERSION_MAJOR >= 60 // FFmpeg 8
-            FF(av_opt_set_array(sink, "pixel_formats", AV_OPT_SEARCH_CHILDREN | AV_OPT_ARRAY_REPLACE,
-                0, FF_ARRAY_ELEMS(pix_fmts) - 1, AV_OPT_TYPE_PIXEL_FMT, pix_fmts)
-            );
+            FF(av_opt_set_array(sink,
+                                "pixel_formats",
+                                AV_OPT_SEARCH_CHILDREN | AV_OPT_ARRAY_REPLACE,
+                                0,
+                                FF_ARRAY_ELEMS(pix_fmts) - 1,
+                                AV_OPT_TYPE_PIXEL_FMT,
+                                pix_fmts));
 #else
             FF(av_opt_set_int_list(sink, "pix_fmts", pix_fmts, -1, AV_OPT_SEARCH_CHILDREN));
-#endif
-#ifdef _MSC_VER
-#pragma warning(pop)
 #endif
         } else if (media_type == AVMEDIA_TYPE_AUDIO) {
             sink = FFMEM(avfilter_graph_alloc_filter(graph.get(), avfilter_get_by_name("abuffersink"), "out"));
 
-#ifdef _MSC_VER
-#pragma warning(push)
-#pragma warning(disable : 4245)
-#endif
-            const AVSampleFormat sample_fmts[] = {AV_SAMPLE_FMT_S32, AV_SAMPLE_FMT_NONE};
-            const int sample_rates[] = {format_desc.audio_sample_rate, -1};
+            const AVSampleFormat sample_fmts[]  = {AV_SAMPLE_FMT_S32, AV_SAMPLE_FMT_NONE};
+            const int            sample_rates[] = {format_desc.audio_sample_rate, -1};
 
             FF(av_opt_set_int(sink, "all_channel_counts", 1, AV_OPT_SEARCH_CHILDREN));
 
 #if LIBAVUTIL_VERSION_MAJOR >= 60 // FFmpeg 8
-            FF(av_opt_set_array(sink, "sample_formats", AV_OPT_SEARCH_CHILDREN | AV_OPT_ARRAY_REPLACE,
-                0, FF_ARRAY_ELEMS(sample_fmts) - 1, AV_OPT_TYPE_SAMPLE_FMT, sample_fmts)
-            );
-            FF(av_opt_set_array(sink, "samplerates", AV_OPT_SEARCH_CHILDREN | AV_OPT_ARRAY_REPLACE,
-                0, FF_ARRAY_ELEMS(sample_rates) - 1, AV_OPT_TYPE_INT, sample_rates)
-            );
+            FF(av_opt_set_array(sink,
+                                "sample_formats",
+                                AV_OPT_SEARCH_CHILDREN | AV_OPT_ARRAY_REPLACE,
+                                0,
+                                FF_ARRAY_ELEMS(sample_fmts) - 1,
+                                AV_OPT_TYPE_SAMPLE_FMT,
+                                sample_fmts));
+            FF(av_opt_set_array(sink,
+                                "samplerates",
+                                AV_OPT_SEARCH_CHILDREN | AV_OPT_ARRAY_REPLACE,
+                                0,
+                                FF_ARRAY_ELEMS(sample_rates) - 1,
+                                AV_OPT_TYPE_INT,
+                                sample_rates));
 #else
             FF(av_opt_set_int_list(sink, "sample_fmts", sample_fmts, -1, AV_OPT_SEARCH_CHILDREN));
             FF(av_opt_set_int_list(sink, "sample_rates", sample_rates, -1, AV_OPT_SEARCH_CHILDREN));
-#endif
-#ifdef _MSC_VER
-#pragma warning(pop)
 #endif
         } else {
             CASPAR_THROW_EXCEPTION(ffmpeg_error_t()
@@ -777,7 +768,7 @@ struct AVProducer::Impl
 
         CASPAR_LOG(debug) << print() << " seekable: " << seekable_;
 
-        thread_ = boost::thread([=] {
+        thread_ = boost::thread([=, this] {
             try {
                 run(seek);
             } catch (boost::thread_interrupted&) {

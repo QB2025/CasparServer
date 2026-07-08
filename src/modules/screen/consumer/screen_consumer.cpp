@@ -53,9 +53,6 @@
 
 #if defined(_MSC_VER)
 #include <windows.h>
-
-#pragma warning(push)
-#pragma warning(disable : 4244)
 #else
 #include "../util/x11_util.h"
 #endif
@@ -68,7 +65,8 @@ namespace caspar { namespace screen {
 
 std::unique_ptr<accelerator::ogl::shader> get_shader()
 {
-    return std::make_unique<accelerator::ogl::shader>(std::string(vertex_shader), std::string(fragment_shader));
+    return std::make_unique<accelerator::ogl::shader>(std::string(reinterpret_cast<const char*>(vertex_shader)),
+                                                      std::string(reinterpret_cast<const char*>(fragment_shader)));
 }
 
 enum class stretch
@@ -254,18 +252,14 @@ struct screen_consumer
         thread_ = std::thread([this] {
             try {
 #if SFML_VERSION_MAJOR >= 3
-                sf::VideoMode mode{
-                    sf::Vector2u(config_.sbs_key ? screen_width_ * 2 : screen_width_, screen_height_),
-                    sf::VideoMode::getDesktopMode().bitsPerPixel
-                };
-                sf::ContextSettings settings{
-                    .depthBits         = 0,
-                    .stencilBits       = 0,
-                    .antiAliasingLevel = 0,
-                    .majorVersion      = 4,
-                    .minorVersion      = 5,
-                    .attributeFlags    = sf::ContextSettings::Attribute::Core
-                };
+                sf::VideoMode mode{sf::Vector2u(config_.sbs_key ? screen_width_ * 2 : screen_width_, screen_height_),
+                                   sf::VideoMode::getDesktopMode().bitsPerPixel};
+                sf::ContextSettings settings{.depthBits         = 0,
+                                             .stencilBits       = 0,
+                                             .antiAliasingLevel = 0,
+                                             .majorVersion      = 4,
+                                             .minorVersion      = 5,
+                                             .attributeFlags    = sf::ContextSettings::Attribute::Core};
                 auto state = config_.windowed || config_.borderless ? sf::State::Windowed : sf::State::Fullscreen;
                 auto style = config_.borderless ? sf::Style::None : sf::Style::Default;
                 window_.create(mode, u8(print()), style, state, settings);
@@ -374,7 +368,7 @@ struct screen_consumer
 
     bool poll()
     {
-        int       count = 0;
+        int count = 0;
 #if SFML_VERSION_MAJOR >= 3
         while (const auto e = window_.pollEvent()) {
             count++;

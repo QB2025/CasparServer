@@ -42,10 +42,6 @@
 
 #include <tbb/concurrent_queue.h>
 
-#if defined(_MSC_VER)
-#pragma warning(push)
-#pragma warning(disable : 4244)
-#endif
 extern "C" {
 #define __STDC_CONSTANT_MACROS
 #define __STDC_LIMIT_MACROS
@@ -53,9 +49,6 @@ extern "C" {
 #include <libavutil/samplefmt.h>
 #include <libswresample/swresample.h>
 }
-#if defined(_MSC_VER)
-#pragma warning(pop)
-#endif
 
 #include <memory>
 #include <vector>
@@ -213,7 +206,7 @@ struct oal_consumer : public core::frame_consumer
 
     ~oal_consumer() override
     {
-        executor_.invoke([=] {
+        executor_.invoke([this] {
             if (source_ != 0u) {
                 alSourceStop(source_);
                 alDeleteSources(1, &source_);
@@ -236,7 +229,7 @@ struct oal_consumer : public core::frame_consumer
         channel_index_ = channel_info.index;
         graph_->set_text(print());
 
-        executor_.begin_invoke([=] {
+        executor_.begin_invoke([this] {
             duration_ = *std::min_element(format_desc_.audio_cadence.begin(), format_desc_.audio_cadence.end());
             buffers_.resize(8);
             alGenBuffers(static_cast<ALsizei>(buffers_.size()), buffers_.data());
@@ -248,7 +241,7 @@ struct oal_consumer : public core::frame_consumer
 
     std::future<bool> send(core::video_field field, core::const_frame frame) override
     {
-        executor_.begin_invoke([=] {
+        executor_.begin_invoke([=, this] {
             auto dst         = std::shared_ptr<AVFrame>(av_frame_alloc(), [](AVFrame* ptr) { av_frame_free(&ptr); });
             dst->format      = AV_SAMPLE_FMT_S16;
             dst->sample_rate = format_desc_.audio_sample_rate;

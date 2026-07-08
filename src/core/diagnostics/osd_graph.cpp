@@ -23,8 +23,6 @@
 
 #include "osd_graph.h"
 
-#pragma warning(disable : 4244)
-
 #include "call_context.h"
 
 #include <common/executor.h>
@@ -53,9 +51,9 @@ namespace caspar { namespace core { namespace diagnostics { namespace osd {
 
 #if SFML_VERSION_MAJOR >= 3
 
-void register_sink() { }
-void show_graphs(bool value) { }
-void shutdown() { }
+void register_sink() {}
+void show_graphs(bool value) {}
+void shutdown() {}
 
 #else
 
