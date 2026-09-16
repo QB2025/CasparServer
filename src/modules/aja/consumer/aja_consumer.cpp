@@ -85,6 +85,7 @@ class aja_consumer final : public core::frame_consumer
 
     std::vector<uint8_t>      video_buffer_;
     std::vector<std::int32_t> audio_buffer_;
+    std::vector<std::int32_t> aja_audio_buffer_;
 
     NTV2AudioSystem audio_system_ = NTV2_AUDIOSYSTEM_1;
 
@@ -265,7 +266,27 @@ class aja_consumer final : public core::frame_consumer
             if (field == core::video_field::a)
                 return caspar::make_ready_future(true);
 
+            constexpr std::size_t caspar_audio_channels = 16;
+            constexpr std::size_t aja_audio_channels    = 8;
+
+            const std::size_t audio_sample_frames = audio_buffer_.size() / caspar_audio_channels;
+
+            aja_audio_buffer_.resize(audio_sample_frames * aja_audio_channels);
+
+            for (std::size_t sample = 0; sample < audio_sample_frames; ++sample) {
+                const auto* src = audio_buffer_.data() + sample * caspar_audio_channels;
+
+                auto* dst = aja_audio_buffer_.data() + sample * aja_audio_channels;
+
+                std::copy(src, src + aja_audio_channels, dst);
+            }
+
+            CASPAR_LOG(info) << L"AJA audio: Caspar " << audio_buffer_.size() << L" samples -> output "
+                             << aja_audio_buffer_.size() << L" samples, "
+                             << aja_audio_buffer_.size() * sizeof(std::int32_t) << L" bytes";
+
             AUTOCIRCULATE_STATUS status;
+
             device_.AutoCirculateGetStatus(kChannel, status);
 
             while (!status.CanAcceptMoreOutputFrames()) {
@@ -278,12 +299,9 @@ class aja_consumer final : public core::frame_consumer
             transfer.SetVideoBuffer(reinterpret_cast<ULWord*>(video_buffer_.data()),
                                     static_cast<ULWord>(video_buffer_.size()));
 
-            if (!audio_buffer_.empty()) {
-                CASPAR_LOG(info) << L"AJA combined audio: " << audio_buffer_.size() << L" samples, "
-                                 << audio_buffer_.size() * sizeof(std::int32_t) << L" bytes";
-
-                transfer.SetAudioBuffer(reinterpret_cast<ULWord*>(audio_buffer_.data()),
-                                        static_cast<ULWord>(audio_buffer_.size() * sizeof(std::int32_t)));
+            if (!aja_audio_buffer_.empty()) {
+                transfer.SetAudioBuffer(reinterpret_cast<ULWord*>(aja_audio_buffer_.data()),
+                                        static_cast<ULWord>(aja_audio_buffer_.size() * sizeof(std::int32_t)));
             }
 
             if (!device_.AutoCirculateTransfer(kChannel, transfer)) {
