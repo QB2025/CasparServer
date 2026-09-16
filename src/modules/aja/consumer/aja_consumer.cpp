@@ -131,11 +131,29 @@ NTV2VideoFormat get_aja_video_format(core::video_format format)
         case core::video_format::x1080p6000:
             return NTV2_FORMAT_1080p_6000_A;
 
+        case core::video_format::x2160p2398:
+            return NTV2_FORMAT_4x1920x1080p_2398;
+
+        case core::video_format::x2160p2400:
+            return NTV2_FORMAT_4x1920x1080p_2400;
+
         case core::video_format::x2160p2500:
             return NTV2_FORMAT_4x1920x1080p_2500;
 
+        case core::video_format::x2160p2997:
+            return NTV2_FORMAT_4x1920x1080p_2997;
+
+        case core::video_format::x2160p3000:
+            return NTV2_FORMAT_4x1920x1080p_3000;
+
         case core::video_format::x2160p5000:
             return NTV2_FORMAT_4x1920x1080p_5000;
+
+        case core::video_format::x2160p5994:
+            return NTV2_FORMAT_4x1920x1080p_5994;
+
+        case core::video_format::x2160p6000:
+            return NTV2_FORMAT_4x1920x1080p_6000;
 
         default:
             return NTV2_FORMAT_UNKNOWN;
