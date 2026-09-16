@@ -439,9 +439,6 @@ class aja_consumer final : public core::frame_consumer
 
             const auto& audio = frame.audio_data();
 
-            CASPAR_LOG(info) << L"AJA audio samples: " << frame.audio_data().size() << L", bytes: "
-                             << (frame.audio_data().size() * sizeof(std::int32_t));
-
             if (interlaced) {
                 const int first_line = field == core::video_field::a ? 0 : 1;
 
