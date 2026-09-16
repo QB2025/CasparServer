@@ -80,6 +80,9 @@ NTV2VideoFormat get_aja_video_format(core::video_format format)
         case core::video_format::x1080i5000:
             return NTV2_FORMAT_1080i_5000;
 
+        case core::video_format::x1080p5000:
+            return NTV2_FORMAT_1080p_5000_A;
+
         default:
             return NTV2_FORMAT_UNKNOWN;
     }
@@ -143,9 +146,8 @@ class aja_consumer final : public core::frame_consumer
         CASPAR_LOG(info) << L"AJA consumer initializing for Caspar channel " << channel_index_ << L", AJA device "
                          << (device_index_ + 1) << L", output channel " << (static_cast<int>(channel_) + 1);
 
-        if (format_desc.width != 1920 || format_desc.height != 1080 ||
-            format_desc.format != core::video_format::x1080i5000) {
-            CASPAR_THROW_EXCEPTION(user_error() << msg_info("Initial AJA consumer supports only 1080i5000"));
+        if (format_desc.width != 1920 || format_desc.height != 1080) {
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info("Initial AJA consumer supports only 1920x1080 formats"));
         }
 
         CNTV2DeviceScanner scanner(true);
@@ -183,8 +185,7 @@ class aja_consumer final : public core::frame_consumer
 
         //
         // AJA SDI output setup and routing.
-        // Mirrors the known-good NTV2Player path for
-        // the selected output channel, YCbCr, 1080i50.
+        // Mirrors the known-good NTV2Player output path.
         //
 
         const NTV2Standard video_std = GetNTV2StandardFromVideoFormat(video_format_);
@@ -245,7 +246,8 @@ class aja_consumer final : public core::frame_consumer
         initialized_            = true;
 
         CASPAR_LOG(info) << L"AJA consumer initialized: device " << (device_index_ + 1) << L", channel "
-                         << (static_cast<int>(channel_) + 1) << L", 1080i50, 8-bit YCbCr, AJA audio system configured";
+                         << (static_cast<int>(channel_) + 1) << L", " << format_desc_.name
+                         << L", 8-bit YCbCr, AJA audio system configured";
     }
 
     std::future<bool> send(core::video_field field, core::const_frame frame) override
@@ -274,20 +276,27 @@ class aja_consumer final : public core::frame_consumer
                 return caspar::make_ready_future(false);
             }
 
-            const int first_line = field == core::video_field::a ? 0 : 1;
-
-            bgra_field_to_interlaced_uyvy(image.data(), video_buffer_.data(), 1920, 1080, first_line);
+            const bool interlaced = format_desc_.field_count == 2;
 
             const auto& audio = frame.audio_data();
 
-            if (field == core::video_field::a) {
-                audio_buffer_.clear();
+            if (interlaced) {
+                const int first_line = field == core::video_field::a ? 0 : 1;
+
+                bgra_field_to_interlaced_uyvy(image.data(), video_buffer_.data(), 1920, 1080, first_line);
+
+                if (field == core::video_field::a)
+                    audio_buffer_.clear();
+
+                audio_buffer_.insert(audio_buffer_.end(), audio.begin(), audio.end());
+
+                if (field == core::video_field::a)
+                    return caspar::make_ready_future(true);
+            } else {
+                bgra_to_uyvy(image.data(), video_buffer_.data(), 1920, 1080);
+
+                audio_buffer_.assign(audio.begin(), audio.end());
             }
-
-            audio_buffer_.insert(audio_buffer_.end(), audio.begin(), audio.end());
-
-            if (field == core::video_field::a)
-                return caspar::make_ready_future(true);
 
             AUTOCIRCULATE_STATUS status;
 
@@ -340,7 +349,8 @@ class aja_consumer final : public core::frame_consumer
     std::wstring print() const override
     {
         std::wstringstream ss;
-        ss << L"AJA [" << (device_index_ + 1) << L"|" << (static_cast<int>(channel_) + 1) << L"|1080i5000]";
+        ss << L"AJA [" << (device_index_ + 1) << L"|" << (static_cast<int>(channel_) + 1) << L"|" << format_desc_.name
+           << L"]";
         return ss.str();
     }
 
