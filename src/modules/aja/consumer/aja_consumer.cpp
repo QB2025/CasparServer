@@ -29,7 +29,6 @@ namespace caspar { namespace aja {
 
 namespace {
 
-constexpr NTV2VideoFormat       kVideoFormat                = NTV2_FORMAT_1080i_5000;
 constexpr NTV2FrameBufferFormat kPixelFormat                = NTV2_FBF_8BIT_YCBCR;
 ULWord                          successful_frame_transfers_ = 0;
 
@@ -75,6 +74,17 @@ void bgra_field_to_interlaced_uyvy(const uint8_t* src, uint8_t* dst, int width, 
     }
 }
 
+NTV2VideoFormat get_aja_video_format(core::video_format format)
+{
+    switch (format) {
+        case core::video_format::x1080i5000:
+            return NTV2_FORMAT_1080i_5000;
+
+        default:
+            return NTV2_FORMAT_UNKNOWN;
+    }
+}
+
 class aja_consumer final : public core::frame_consumer
 {
     CNTV2Card               device_;
@@ -86,8 +96,9 @@ class aja_consumer final : public core::frame_consumer
 
     NTV2AudioSystem audio_system_ = NTV2_AUDIOSYSTEM_1;
 
-    ULWord      device_index_ = 0;
-    NTV2Channel channel_      = NTV2_CHANNEL1;
+    ULWord          device_index_ = 0;
+    NTV2Channel     channel_      = NTV2_CHANNEL1;
+    NTV2VideoFormat video_format_ = NTV2_FORMAT_UNKNOWN;
 
     bool initialized_            = false;
     bool auto_circulate_started_ = false;
@@ -118,6 +129,12 @@ class aja_consumer final : public core::frame_consumer
     {
         format_desc_   = format_desc;
         channel_index_ = channel_info.index;
+
+        video_format_ = get_aja_video_format(format_desc.format);
+
+        if (video_format_ == NTV2_FORMAT_UNKNOWN) {
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info("Unsupported CasparCG video format for AJA output"));
+        }
 
         const std::size_t frame_buffer_size = 1920u * 1080u * 2u;
 
@@ -155,7 +172,7 @@ class aja_consumer final : public core::frame_consumer
 
         device_.SetReference(NTV2_REFERENCE_FREERUN);
 
-        if (!device_.SetVideoFormat(kVideoFormat, false, false, channel_)) {
+        if (!device_.SetVideoFormat(video_format_, false, false, channel_)) {
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set AJA video format to 1080i50"));
         }
 
@@ -170,7 +187,7 @@ class aja_consumer final : public core::frame_consumer
         // the selected output channel, YCbCr, 1080i50.
         //
 
-        const NTV2Standard video_std = GetNTV2StandardFromVideoFormat(kVideoFormat);
+        const NTV2Standard video_std = GetNTV2StandardFromVideoFormat(video_format_);
 
         device_.SetSDIOutputStandard(channel_, video_std);
 
@@ -204,7 +221,7 @@ class aja_consumer final : public core::frame_consumer
 
         ULWord num_audio_channels = device_.features().GetMaxAudioChannels();
 
-        if (num_audio_channels > 8 && !device_.features().CanDo2110() && NTV2_IS_2K_1080_VIDEO_FORMAT(kVideoFormat)) {
+        if (num_audio_channels > 8 && !device_.features().CanDo2110() && NTV2_IS_2K_1080_VIDEO_FORMAT(video_format_)) {
             num_audio_channels = 8;
         }
 
