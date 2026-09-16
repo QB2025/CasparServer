@@ -77,6 +77,21 @@ void bgra_field_to_interlaced_uyvy(const uint8_t* src, uint8_t* dst, int width, 
 NTV2VideoFormat get_aja_video_format(core::video_format format)
 {
     switch (format) {
+        case core::video_format::x720p2398:
+            return NTV2_FORMAT_720p_2398;
+
+        case core::video_format::x720p2500:
+            return NTV2_FORMAT_720p_2500;
+
+        case core::video_format::x720p5000:
+            return NTV2_FORMAT_720p_5000;
+
+        case core::video_format::x720p5994:
+            return NTV2_FORMAT_720p_5994;
+
+        case core::video_format::x720p6000:
+            return NTV2_FORMAT_720p_6000;
+
         case core::video_format::x1080i5000:
             return NTV2_FORMAT_1080i_5000;
 
@@ -182,6 +197,11 @@ class aja_consumer final : public core::frame_consumer
 
         if (!device_.features().CanDoChannel(channel_)) {
             CASPAR_THROW_EXCEPTION(user_error() << msg_info("Selected AJA device does not support requested channel"));
+        }
+
+        if (!device_.features().CanDoVideoFormat(video_format_)) {
+            CASPAR_THROW_EXCEPTION(user_error()
+                                   << msg_info("Selected AJA device does not support requested video format"));
         }
 
         device_.SetEveryFrameServices(NTV2_OEM_TASKS);
