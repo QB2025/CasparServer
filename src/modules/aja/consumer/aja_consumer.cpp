@@ -29,8 +29,7 @@ namespace caspar { namespace aja {
 
 namespace {
 
-constexpr NTV2FrameBufferFormat kPixelFormat                = NTV2_FBF_8BIT_YCBCR;
-ULWord                          successful_frame_transfers_ = 0;
+constexpr NTV2FrameBufferFormat kPixelFormat = NTV2_FBF_8BIT_YCBCR;
 
 inline std::uint8_t clamp_byte(int value) { return static_cast<std::uint8_t>(std::max(0, std::min(255, value))); }
 
@@ -175,8 +174,9 @@ class aja_consumer final : public core::frame_consumer
     NTV2Channel     channel_      = NTV2_CHANNEL1;
     NTV2VideoFormat video_format_ = NTV2_FORMAT_UNKNOWN;
 
-    bool initialized_            = false;
-    bool auto_circulate_started_ = false;
+    bool   initialized_                = false;
+    bool   auto_circulate_started_     = false;
+    ULWord successful_frame_transfers_ = 0;
 
   public:
     aja_consumer(ULWord device_index, NTV2Channel channel)
@@ -363,7 +363,7 @@ class aja_consumer final : public core::frame_consumer
             connections.insert(NTV2XptConnection(GetSDIOutputInputXpt(channel_), source_xpt));
         }
 
-        if (!device_.ApplySignalRoute(connections, true)) {
+        if (!device_.ApplySignalRoute(connections, false)) {
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to apply AJA output routing"));
         }
 
