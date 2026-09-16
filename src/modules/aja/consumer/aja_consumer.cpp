@@ -217,7 +217,8 @@ class aja_consumer final : public core::frame_consumer
         auto_circulate_started_ = false;
         initialized_            = true;
 
-        CASPAR_LOG(info) << L"AJA consumer initialized: device 0, channel 1, " << L"1080i50, 8-bit YCbCr, AJA audio system configured";
+        CASPAR_LOG(info) << L"AJA consumer initialized: device 0, channel 1, "
+                         << L"1080i50, 8-bit YCbCr, AJA audio system configured";
     }
 
     std::future<bool> send(core::video_field field, core::const_frame frame) override
@@ -273,6 +274,11 @@ class aja_consumer final : public core::frame_consumer
 
             transfer.SetVideoBuffer(reinterpret_cast<ULWord*>(video_buffer_.data()),
                                     static_cast<ULWord>(video_buffer_.size()));
+
+            if (!audio_buffer_.empty()) {
+                transfer.SetAudioBuffer(reinterpret_cast<ULWord*>(audio_buffer_.data()),
+                                        static_cast<ULWord>(audio_buffer_.size() * sizeof(std::int32_t)));
+            }
 
             if (!device_.AutoCirculateTransfer(kChannel, transfer)) {
                 CASPAR_LOG(error) << L"AJA AutoCirculateTransfer failed";
