@@ -165,9 +165,9 @@ class aja_consumer final : public core::frame_consumer
         }
 
         //
-        // Corvid 44 SDI output setup and routing.
+        // AJA SDI output setup and routing.
         // Mirrors the known-good NTV2Player path for
-        // channel 1, YCbCr, 1080i50.
+        // the selected output channel, YCbCr, 1080i50.
         //
 
         const NTV2Standard video_std = GetNTV2StandardFromVideoFormat(kVideoFormat);
