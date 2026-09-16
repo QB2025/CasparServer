@@ -166,16 +166,13 @@ class aja_consumer final : public core::frame_consumer
             CASPAR_THROW_EXCEPTION(user_error() << msg_info("Unsupported CasparCG video format for AJA output"));
         }
 
-        const std::size_t frame_buffer_size = 1920u * 1080u * 2u;
+        const std::size_t frame_buffer_size =
+            static_cast<std::size_t>(format_desc.width) * static_cast<std::size_t>(format_desc.height) * 2u;
 
         video_buffer_.resize(frame_buffer_size);
 
         CASPAR_LOG(info) << L"AJA consumer initializing for Caspar channel " << channel_index_ << L", AJA device "
                          << (device_index_ + 1) << L", output channel " << (static_cast<int>(channel_) + 1);
-
-        if (format_desc.width != 1920 || format_desc.height != 1080) {
-            CASPAR_THROW_EXCEPTION(user_error() << msg_info("Initial AJA consumer supports only 1920x1080 formats"));
-        }
 
         CNTV2DeviceScanner scanner(true);
 
@@ -294,7 +291,8 @@ class aja_consumer final : public core::frame_consumer
 
             const auto& image = frame.image_data(0);
 
-            const std::size_t expected = static_cast<std::size_t>(1920) * static_cast<std::size_t>(1080) * 4u;
+            const std::size_t expected =
+                static_cast<std::size_t>(format_desc_.width) * static_cast<std::size_t>(format_desc_.height) * 4u;
 
             if (image.size() < expected) {
                 CASPAR_LOG(error) << L"AJA consumer received undersized BGRA frame: " << image.size()
@@ -310,7 +308,8 @@ class aja_consumer final : public core::frame_consumer
             if (interlaced) {
                 const int first_line = field == core::video_field::a ? 0 : 1;
 
-                bgra_field_to_interlaced_uyvy(image.data(), video_buffer_.data(), 1920, 1080, first_line);
+                bgra_field_to_interlaced_uyvy(
+                    image.data(), video_buffer_.data(), format_desc_.width, format_desc_.height, first_line);
 
                 if (field == core::video_field::a)
                     audio_buffer_.clear();
@@ -320,7 +319,7 @@ class aja_consumer final : public core::frame_consumer
                 if (field == core::video_field::a)
                     return caspar::make_ready_future(true);
             } else {
-                bgra_to_uyvy(image.data(), video_buffer_.data(), 1920, 1080);
+                bgra_to_uyvy(image.data(), video_buffer_.data(), format_desc_.width, format_desc_.height);
 
                 audio_buffer_.assign(audio.begin(), audio.end());
             }
