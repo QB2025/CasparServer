@@ -131,6 +131,12 @@ NTV2VideoFormat get_aja_video_format(core::video_format format)
         case core::video_format::x1080p6000:
             return NTV2_FORMAT_1080p_6000_A;
 
+        case core::video_format::x2160p2500:
+            return NTV2_FORMAT_4x1920x1080p_2500;
+
+        case core::video_format::x2160p5000:
+            return NTV2_FORMAT_4x1920x1080p_5000;
+
         default:
             return NTV2_FORMAT_UNKNOWN;
     }
@@ -183,6 +189,9 @@ class aja_consumer final : public core::frame_consumer
 
         video_format_ = get_aja_video_format(format_desc.format);
 
+        const bool is_uhd     = format_desc.width == 3840 && format_desc.height == 2160;
+        const bool is_uhd_hfr = is_uhd && format_desc.fps > 30.0;
+
         if (video_format_ == NTV2_FORMAT_UNKNOWN) {
             CASPAR_THROW_EXCEPTION(user_error() << msg_info("Unsupported CasparCG video format for AJA output"));
         }
@@ -205,6 +214,17 @@ class aja_consumer final : public core::frame_consumer
             CASPAR_THROW_EXCEPTION(user_error() << msg_info("Selected AJA device does not support requested channel"));
         }
 
+        if (is_uhd && channel_ != NTV2_CHANNEL1) {
+            CASPAR_THROW_EXCEPTION(user_error()
+                                   << msg_info("Initial AJA UHD TSI implementation supports output channel 1 only"));
+        }
+
+        if (is_uhd && !device_.features().CanDoChannel(NTV2_CHANNEL2)) {
+            CASPAR_THROW_EXCEPTION(
+                user_error() << msg_info(
+                    "Selected AJA device does not provide the second channel required for UHD TSI output"));
+        }
+
         if (!device_.features().CanDoVideoFormat(video_format_)) {
             CASPAR_THROW_EXCEPTION(user_error()
                                    << msg_info("Selected AJA device does not support requested video format"));
@@ -212,25 +232,54 @@ class aja_consumer final : public core::frame_consumer
 
         device_.SetEveryFrameServices(NTV2_OEM_TASKS);
 
-        if (!device_.EnableChannel(channel_)) {
-            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to enable selected AJA channel"));
-        }
+        if (is_uhd) {
+            //
+            // UHD TSI on the original Corvid44 uses two FrameStores.
+            // Initial implementation is intentionally restricted to channel 1.
+            //
+            NTV2ChannelSet frame_stores = ::NTV2MakeChannelSet(NTV2_CHANNEL1, 2);
 
-        device_.SetMode(channel_, NTV2_MODE_DISPLAY);
+            if (!device_.EnableChannels(frame_stores)) {
+                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to enable AJA UHD FrameStores"));
+            }
 
-        device_.SetVANCMode(NTV2_VANCMODE_OFF, channel_);
+            device_.SetMode(frame_stores, NTV2_MODE_DISPLAY);
 
-        device_.SetVANCShiftMode(channel_, NTV2_VANCDATA_NORMAL);
+            device_.SetVANCMode(frame_stores, NTV2_VANCMODE_OFF);
 
-        device_.SetReference(NTV2_REFERENCE_FREERUN);
+            device_.SetVANCShiftMode(frame_stores, NTV2_VANCDATA_NORMAL);
 
-        if (!device_.SetVideoFormat(video_format_, false, false, channel_)) {
-            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set selected AJA video format"));
-        }
+            device_.SetReference(NTV2_REFERENCE_FREERUN);
 
-        if (!device_.SetFrameBufferFormat(channel_, kPixelFormat)) {
-            CASPAR_THROW_EXCEPTION(caspar_exception()
-                                   << msg_info("Unable to set AJA framebuffer format to 8-bit YCbCr"));
+            if (!device_.SetVideoFormat(frame_stores, video_format_, false)) {
+                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set AJA UHD video format"));
+            }
+
+            if (!device_.SetFrameBufferFormat(frame_stores, kPixelFormat)) {
+                CASPAR_THROW_EXCEPTION(caspar_exception()
+                                       << msg_info("Unable to set AJA UHD framebuffer format to 8-bit YCbCr"));
+            }
+        } else {
+            if (!device_.EnableChannel(channel_)) {
+                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to enable selected AJA channel"));
+            }
+
+            device_.SetMode(channel_, NTV2_MODE_DISPLAY);
+
+            device_.SetVANCMode(NTV2_VANCMODE_OFF, channel_);
+
+            device_.SetVANCShiftMode(channel_, NTV2_VANCDATA_NORMAL);
+
+            device_.SetReference(NTV2_REFERENCE_FREERUN);
+
+            if (!device_.SetVideoFormat(video_format_, false, false, channel_)) {
+                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set selected AJA video format"));
+            }
+
+            if (!device_.SetFrameBufferFormat(channel_, kPixelFormat)) {
+                CASPAR_THROW_EXCEPTION(caspar_exception()
+                                       << msg_info("Unable to set AJA framebuffer format to 8-bit YCbCr"));
+            }
         }
 
         //
@@ -250,13 +299,66 @@ class aja_consumer final : public core::frame_consumer
 
         NTV2XptConnections connections;
 
-        const NTV2OutputXptID source_xpt = GetFrameStoreOutputXptFromChannel(channel_,
-                                                                             false); // YCbCr
+        if (is_uhd) {
+            //
+            // UHD TSI routing for original Corvid44, channel 1.
+            //
+            // Two UHD FrameStores feed four 4:2:5 mux inputs.  The mux
+            // outputs are carried as DS1/DS2 on SDI outputs 1 and 2.
+            //
+            connections.insert(NTV2XptConnection(NTV2_Xpt425Mux1AInput, NTV2_XptFrameBuffer1YUV));
 
-        connections.insert(NTV2XptConnection(GetSDIOutputInputXpt(channel_), source_xpt));
+            connections.insert(NTV2XptConnection(NTV2_Xpt425Mux1BInput, NTV2_XptFrameBuffer1_DS2YUV));
+
+            connections.insert(NTV2XptConnection(NTV2_Xpt425Mux2AInput, NTV2_XptFrameBuffer2YUV));
+
+            connections.insert(NTV2XptConnection(NTV2_Xpt425Mux2BInput, NTV2_XptFrameBuffer2_DS2YUV));
+
+            if (is_uhd_hfr) {
+                //
+                // High-frame-rate UHD TSI:
+                // four mux components are carried on four SDI outputs.
+                //
+                connections.insert(NTV2XptConnection(NTV2_XptSDIOut1Input, NTV2_Xpt425Mux1AYUV));
+
+                connections.insert(NTV2XptConnection(NTV2_XptSDIOut2Input, NTV2_Xpt425Mux1BYUV));
+
+                connections.insert(NTV2XptConnection(NTV2_XptSDIOut3Input, NTV2_Xpt425Mux2AYUV));
+
+                connections.insert(NTV2XptConnection(NTV2_XptSDIOut4Input, NTV2_Xpt425Mux2BYUV));
+            } else {
+                //
+                // Low-frame-rate UHD TSI:
+                // two SDI outputs, each carrying DS1 + DS2.
+                //
+                connections.insert(NTV2XptConnection(NTV2_XptSDIOut1Input, NTV2_Xpt425Mux1AYUV));
+
+                connections.insert(NTV2XptConnection(NTV2_XptSDIOut1InputDS2, NTV2_Xpt425Mux1BYUV));
+
+                connections.insert(NTV2XptConnection(NTV2_XptSDIOut2Input, NTV2_Xpt425Mux2AYUV));
+
+                connections.insert(NTV2XptConnection(NTV2_XptSDIOut2InputDS2, NTV2_Xpt425Mux2BYUV));
+            }
+        } else {
+            const NTV2OutputXptID source_xpt = GetFrameStoreOutputXptFromChannel(channel_, false);
+
+            connections.insert(NTV2XptConnection(GetSDIOutputInputXpt(channel_), source_xpt));
+        }
 
         if (!device_.ApplySignalRoute(connections, true)) {
-            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to apply AJA SDI routing"));
+            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to apply AJA output routing"));
+        }
+
+        if (is_uhd) {
+            device_.SetTsiFrameEnable(true, NTV2_CHANNEL1);
+
+            device_.SetSDITransmitEnable(NTV2_CHANNEL1, true);
+            device_.SetSDITransmitEnable(NTV2_CHANNEL2, true);
+
+            if (is_uhd_hfr) {
+                device_.SetSDITransmitEnable(NTV2_CHANNEL3, true);
+                device_.SetSDITransmitEnable(NTV2_CHANNEL4, true);
+            }
         }
 
         device_.AutoCirculateStop(channel_);
@@ -282,7 +384,13 @@ class aja_consumer final : public core::frame_consumer
 
         device_.SetAudioBufferSize(NTV2_AUDIO_BUFFER_BIG, audio_system_);
 
-        device_.SetSDIOutputAudioSystem(channel_, audio_system_);
+        if (is_uhd) {
+            const NTV2ChannelSet audio_spigots = ::NTV2MakeChannelSet(NTV2_CHANNEL1, 4);
+
+            device_.SetSDIOutputAudioSystem(audio_spigots, audio_system_);
+        } else {
+            device_.SetSDIOutputAudioSystem(channel_, audio_system_);
+        }
 
         device_.SetSDIOutputDS2AudioSystem(channel_, audio_system_);
 
@@ -330,6 +438,9 @@ class aja_consumer final : public core::frame_consumer
             const bool interlaced = format_desc_.field_count == 2;
 
             const auto& audio = frame.audio_data();
+
+            CASPAR_LOG(info) << L"AJA audio samples: " << frame.audio_data().size() << L", bytes: "
+                             << (frame.audio_data().size() * sizeof(std::int32_t));
 
             if (interlaced) {
                 const int first_line = field == core::video_field::a ? 0 : 1;
