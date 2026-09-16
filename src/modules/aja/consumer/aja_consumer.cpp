@@ -77,6 +77,12 @@ void bgra_field_to_interlaced_uyvy(const uint8_t* src, uint8_t* dst, int width, 
 NTV2VideoFormat get_aja_video_format(core::video_format format)
 {
     switch (format) {
+        case core::video_format::pal:
+            return NTV2_FORMAT_625_5000;
+
+        case core::video_format::ntsc:
+            return NTV2_FORMAT_525_5994;
+
         case core::video_format::x720p2398:
             return NTV2_FORMAT_720p_2398;
 
