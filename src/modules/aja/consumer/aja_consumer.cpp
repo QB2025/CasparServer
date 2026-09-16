@@ -83,7 +83,8 @@ class aja_consumer final : public core::frame_consumer
     core::video_format_desc format_desc_;
     int                     channel_index_ = 0;
 
-    std::vector<uint8_t> video_buffer_;
+    std::vector<uint8_t>      video_buffer_;
+    std::vector<std::int32_t> audio_buffer_;
 
     bool initialized_            = false;
     bool auto_circulate_started_ = false;
@@ -220,6 +221,14 @@ class aja_consumer final : public core::frame_consumer
             const int first_line = field == core::video_field::a ? 0 : 1;
 
             bgra_field_to_interlaced_uyvy(image.data(), video_buffer_.data(), 1920, 1080, first_line);
+
+            const auto& audio = frame.audio_data();
+
+            if (field == core::video_field::a) {
+                audio_buffer_.clear();
+            }
+
+            audio_buffer_.insert(audio_buffer_.end(), audio.begin(), audio.end());
 
             if (field == core::video_field::a)
                 return caspar::make_ready_future(true);
