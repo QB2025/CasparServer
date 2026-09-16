@@ -29,8 +29,6 @@ namespace caspar { namespace aja {
 
 namespace {
 
-constexpr ULWord                kDeviceIndex                = 0;
-constexpr NTV2Channel           kChannel                    = NTV2_CHANNEL1;
 constexpr NTV2VideoFormat       kVideoFormat                = NTV2_FORMAT_1080i_5000;
 constexpr NTV2FrameBufferFormat kPixelFormat                = NTV2_FBF_8BIT_YCBCR;
 ULWord                          successful_frame_transfers_ = 0;
@@ -88,22 +86,28 @@ class aja_consumer final : public core::frame_consumer
 
     NTV2AudioSystem audio_system_ = NTV2_AUDIOSYSTEM_1;
 
+    ULWord      device_index_ = 0;
+    NTV2Channel channel_      = NTV2_CHANNEL1;
+
     bool initialized_            = false;
     bool auto_circulate_started_ = false;
-    bool audio_layout_logged_    = false;
 
   public:
-    aja_consumer() = default;
+    aja_consumer(ULWord device_index, NTV2Channel channel)
+        : device_index_(device_index)
+        , channel_(channel)
+    {
+    }
 
     ~aja_consumer() override
     {
         try {
             if (auto_circulate_started_) {
-                device_.AutoCirculateStop(kChannel);
+                device_.AutoCirculateStop(channel_);
                 auto_circulate_started_ = false;
             }
 
-            device_.DisableChannel(kChannel);
+            device_.DisableChannel(channel_);
         } catch (...) {
         }
     }
@@ -119,7 +123,8 @@ class aja_consumer final : public core::frame_consumer
 
         video_buffer_.resize(frame_buffer_size);
 
-        CASPAR_LOG(info) << L"AJA consumer initializing for Caspar channel " << channel_index_;
+        CASPAR_LOG(info) << L"AJA consumer initializing for Caspar channel " << channel_index_ << L", AJA device "
+                         << (device_index_ + 1) << L", output channel " << (static_cast<int>(channel_) + 1);
 
         if (format_desc.width != 1920 || format_desc.height != 1080 ||
             format_desc.format != core::video_format::x1080i5000) {
@@ -128,29 +133,33 @@ class aja_consumer final : public core::frame_consumer
 
         CNTV2DeviceScanner scanner(true);
 
-        if (!CNTV2DeviceScanner::GetDeviceAtIndex(kDeviceIndex, device_)) {
-            CASPAR_THROW_EXCEPTION(user_error() << msg_info("Unable to open AJA device 0"));
+        if (!CNTV2DeviceScanner::GetDeviceAtIndex(device_index_, device_)) {
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info("Unable to open selected AJA device"));
+        }
+
+        if (!device_.features().CanDoChannel(channel_)) {
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info("Selected AJA device does not support requested channel"));
         }
 
         device_.SetEveryFrameServices(NTV2_OEM_TASKS);
 
-        if (!device_.EnableChannel(kChannel)) {
-            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to enable AJA channel 1"));
+        if (!device_.EnableChannel(channel_)) {
+            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to enable selected AJA channel"));
         }
 
-        device_.SetMode(kChannel, NTV2_MODE_DISPLAY);
+        device_.SetMode(channel_, NTV2_MODE_DISPLAY);
 
-        device_.SetVANCMode(NTV2_VANCMODE_OFF, kChannel);
+        device_.SetVANCMode(NTV2_VANCMODE_OFF, channel_);
 
-        device_.SetVANCShiftMode(kChannel, NTV2_VANCDATA_NORMAL);
+        device_.SetVANCShiftMode(channel_, NTV2_VANCDATA_NORMAL);
 
         device_.SetReference(NTV2_REFERENCE_FREERUN);
 
-        if (!device_.SetVideoFormat(kVideoFormat, false, false, kChannel)) {
+        if (!device_.SetVideoFormat(kVideoFormat, false, false, channel_)) {
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set AJA video format to 1080i50"));
         }
 
-        if (!device_.SetFrameBufferFormat(kChannel, kPixelFormat)) {
+        if (!device_.SetFrameBufferFormat(channel_, kPixelFormat)) {
             CASPAR_THROW_EXCEPTION(caspar_exception()
                                    << msg_info("Unable to set AJA framebuffer format to 8-bit YCbCr"));
         }
@@ -163,32 +172,32 @@ class aja_consumer final : public core::frame_consumer
 
         const NTV2Standard video_std = GetNTV2StandardFromVideoFormat(kVideoFormat);
 
-        device_.SetSDIOutputStandard(kChannel, video_std);
+        device_.SetSDIOutputStandard(channel_, video_std);
 
-        device_.SetSDIOutLevelAtoLevelBConversion(kChannel, false);
+        device_.SetSDIOutLevelAtoLevelBConversion(channel_, false);
 
-        device_.SetSDIOutRGBLevelAConversion(kChannel, false);
+        device_.SetSDIOutRGBLevelAConversion(channel_, false);
 
-        device_.SetSDITransmitEnable(kChannel, true);
+        device_.SetSDITransmitEnable(channel_, true);
 
         NTV2XptConnections connections;
 
-        const NTV2OutputXptID source_xpt = GetFrameStoreOutputXptFromChannel(kChannel,
+        const NTV2OutputXptID source_xpt = GetFrameStoreOutputXptFromChannel(channel_,
                                                                              false); // YCbCr
 
-        connections.insert(NTV2XptConnection(GetSDIOutputInputXpt(kChannel), source_xpt));
+        connections.insert(NTV2XptConnection(GetSDIOutputInputXpt(channel_), source_xpt));
 
         if (!device_.ApplySignalRoute(connections, true)) {
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to apply AJA SDI routing"));
         }
 
-        device_.AutoCirculateStop(kChannel);
-        device_.WaitForOutputVerticalInterrupt(kChannel, 4);
+        device_.AutoCirculateStop(channel_);
+        device_.WaitForOutputVerticalInterrupt(channel_, 4);
 
         audio_system_ = NTV2_AUDIOSYSTEM_1;
 
         if (device_.features().GetNumAudioSystems() > 1)
-            audio_system_ = NTV2ChannelToAudioSystem(kChannel);
+            audio_system_ = NTV2ChannelToAudioSystem(channel_);
 
         if (!device_.features().CanDoFrameStore1Display())
             audio_system_ = NTV2_AUDIOSYSTEM_1;
@@ -205,21 +214,21 @@ class aja_consumer final : public core::frame_consumer
 
         device_.SetAudioBufferSize(NTV2_AUDIO_BUFFER_BIG, audio_system_);
 
-        device_.SetSDIOutputAudioSystem(kChannel, audio_system_);
+        device_.SetSDIOutputAudioSystem(channel_, audio_system_);
 
-        device_.SetSDIOutputDS2AudioSystem(kChannel, audio_system_);
+        device_.SetSDIOutputDS2AudioSystem(channel_, audio_system_);
 
         device_.SetAudioLoopBack(NTV2_AUDIO_LOOPBACK_OFF, audio_system_);
 
-        if (!device_.AutoCirculateInitForOutput(kChannel, 7, audio_system_, AUTOCIRCULATE_WITH_RP188)) {
+        if (!device_.AutoCirculateInitForOutput(channel_, 7, audio_system_, AUTOCIRCULATE_WITH_RP188)) {
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to initialize AJA AutoCirculate output"));
         }
 
         auto_circulate_started_ = false;
         initialized_            = true;
 
-        CASPAR_LOG(info) << L"AJA consumer initialized: device 0, channel 1, "
-                         << L"1080i50, 8-bit YCbCr, AJA audio system configured";
+        CASPAR_LOG(info) << L"AJA consumer initialized: device " << (device_index_ + 1) << L", channel "
+                         << (static_cast<int>(channel_) + 1) << L", 1080i50, 8-bit YCbCr, AJA audio system configured";
     }
 
     std::future<bool> send(core::video_field field, core::const_frame frame) override
@@ -265,11 +274,11 @@ class aja_consumer final : public core::frame_consumer
 
             AUTOCIRCULATE_STATUS status;
 
-            device_.AutoCirculateGetStatus(kChannel, status);
+            device_.AutoCirculateGetStatus(channel_, status);
 
             while (!status.CanAcceptMoreOutputFrames()) {
-                device_.WaitForOutputVerticalInterrupt(kChannel);
-                device_.AutoCirculateGetStatus(kChannel, status);
+                device_.WaitForOutputVerticalInterrupt(channel_);
+                device_.AutoCirculateGetStatus(channel_, status);
             }
 
             AUTOCIRCULATE_TRANSFER transfer;
@@ -282,7 +291,7 @@ class aja_consumer final : public core::frame_consumer
                                         static_cast<ULWord>(audio_buffer_.size() * sizeof(std::int32_t)));
             }
 
-            if (!device_.AutoCirculateTransfer(kChannel, transfer)) {
+            if (!device_.AutoCirculateTransfer(channel_, transfer)) {
                 CASPAR_LOG(error) << L"AJA AutoCirculateTransfer failed";
                 return caspar::make_ready_future(false);
             }
@@ -290,7 +299,7 @@ class aja_consumer final : public core::frame_consumer
             ++successful_frame_transfers_;
 
             if (!auto_circulate_started_ && successful_frame_transfers_ >= 3) {
-                if (!device_.AutoCirculateStart(kChannel)) {
+                if (!device_.AutoCirculateStart(channel_)) {
                     CASPAR_LOG(error) << L"Unable to start AJA AutoCirculate frame output";
 
                     return caspar::make_ready_future(true);
@@ -311,7 +320,12 @@ class aja_consumer final : public core::frame_consumer
 
     core::monitor::state state() const override { return {}; }
 
-    std::wstring print() const override { return L"AJA [0|1|1080i5000]"; }
+    std::wstring print() const override
+    {
+        std::wstringstream ss;
+        ss << L"AJA [" << (device_index_ + 1) << L"|" << (static_cast<int>(channel_) + 1) << L"|1080i5000]";
+        return ss.str();
+    }
 
     std::wstring name() const override { return L"aja"; }
 
@@ -330,7 +344,7 @@ spl::shared_ptr<core::frame_consumer> create_consumer(const std::vector<std::wst
     if (params.empty() || !boost::iequals(params.at(0), L"AJA"))
         return core::frame_consumer::empty();
 
-    return spl::make_shared<aja_consumer>();
+    return spl::make_shared<aja_consumer>(0, NTV2_CHANNEL1);
 }
 
 spl::shared_ptr<core::frame_consumer>
@@ -339,7 +353,18 @@ create_preconfigured_consumer(const boost::property_tree::wptree&               
                               const std::vector<spl::shared_ptr<core::video_channel>>& channels,
                               const core::channel_info&                                channel_info)
 {
-    return spl::make_shared<aja_consumer>();
+    const int device  = ptree.get<int>(L"device", 1);
+    const int channel = ptree.get<int>(L"channel", 1);
+
+    if (device < 1) {
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info("AJA device must be >= 1"));
+    }
+
+    if (channel < 1) {
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info("AJA channel must be >= 1"));
+    }
+
+    return spl::make_shared<aja_consumer>(static_cast<ULWord>(device - 1), static_cast<NTV2Channel>(channel - 1));
 }
 
 }} // namespace caspar::aja
