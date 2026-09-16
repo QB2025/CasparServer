@@ -86,6 +86,8 @@ class aja_consumer final : public core::frame_consumer
     std::vector<uint8_t>      video_buffer_;
     std::vector<std::int32_t> audio_buffer_;
 
+    NTV2AudioSystem audio_system_ = NTV2_AUDIOSYSTEM_1;
+
     bool initialized_            = false;
     bool auto_circulate_started_ = false;
 
@@ -182,14 +184,40 @@ class aja_consumer final : public core::frame_consumer
         device_.AutoCirculateStop(kChannel);
         device_.WaitForOutputVerticalInterrupt(kChannel, 4);
 
-        if (!device_.AutoCirculateInitForOutput(kChannel, 7, NTV2_AUDIOSYSTEM_INVALID, AUTOCIRCULATE_WITH_RP188)) {
+        audio_system_ = NTV2_AUDIOSYSTEM_1;
+
+        if (device_.features().GetNumAudioSystems() > 1)
+            audio_system_ = NTV2ChannelToAudioSystem(kChannel);
+
+        if (!device_.features().CanDoFrameStore1Display())
+            audio_system_ = NTV2_AUDIOSYSTEM_1;
+
+        ULWord num_audio_channels = device_.features().GetMaxAudioChannels();
+
+        if (num_audio_channels > 8 && !device_.features().CanDo2110() && NTV2_IS_2K_1080_VIDEO_FORMAT(kVideoFormat)) {
+            num_audio_channels = 8;
+        }
+
+        device_.SetNumberAudioChannels(num_audio_channels, audio_system_);
+
+        device_.SetAudioRate(NTV2_AUDIO_48K, audio_system_);
+
+        device_.SetAudioBufferSize(NTV2_AUDIO_BUFFER_BIG, audio_system_);
+
+        device_.SetSDIOutputAudioSystem(kChannel, audio_system_);
+
+        device_.SetSDIOutputDS2AudioSystem(kChannel, audio_system_);
+
+        device_.SetAudioLoopBack(NTV2_AUDIO_LOOPBACK_OFF, audio_system_);
+
+        if (!device_.AutoCirculateInitForOutput(kChannel, 7, audio_system_, AUTOCIRCULATE_WITH_RP188)) {
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to initialize AJA AutoCirculate output"));
         }
 
         auto_circulate_started_ = false;
         initialized_            = true;
 
-        CASPAR_LOG(info) << L"AJA consumer initialized: device 0, channel 1, " << L"1080i50, 8-bit YCbCr, video only";
+        CASPAR_LOG(info) << L"AJA consumer initialized: device 0, channel 1, " << L"1080i50, 8-bit YCbCr, AJA audio system configured";
     }
 
     std::future<bool> send(core::video_field field, core::const_frame frame) override
