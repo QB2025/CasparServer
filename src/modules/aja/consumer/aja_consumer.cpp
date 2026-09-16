@@ -253,6 +253,9 @@ class aja_consumer final : public core::frame_consumer
 
             const auto& audio = frame.audio_data();
 
+            CASPAR_LOG(info) << L"AJA audio field " << (field == core::video_field::a ? L"A" : L"B") << L": "
+                             << audio.size() << L" samples";
+
             if (field == core::video_field::a) {
                 audio_buffer_.clear();
             }
@@ -276,6 +279,9 @@ class aja_consumer final : public core::frame_consumer
                                     static_cast<ULWord>(video_buffer_.size()));
 
             if (!audio_buffer_.empty()) {
+                CASPAR_LOG(info) << L"AJA combined audio: " << audio_buffer_.size() << L" samples, "
+                                 << audio_buffer_.size() * sizeof(std::int32_t) << L" bytes";
+
                 transfer.SetAudioBuffer(reinterpret_cast<ULWord*>(audio_buffer_.data()),
                                         static_cast<ULWord>(audio_buffer_.size() * sizeof(std::int32_t)));
             }
