@@ -26,7 +26,6 @@
 #include <vector>
 
 namespace caspar { namespace aja {
-
 namespace {
 
 constexpr NTV2FrameBufferFormat kPixelFormat = NTV2_FBF_8BIT_YCBCR;
@@ -70,6 +69,39 @@ void bgra_field_to_interlaced_uyvy(const uint8_t* src, uint8_t* dst, int width, 
 
     for (int y = first_line; y < height; y += 2) {
         bgra_to_uyvy(src + y * src_stride, dst + y * dst_stride, width, 1);
+    }
+}
+
+void bgra_to_key_uyvy(const std::uint8_t* src, std::uint8_t* dst, std::size_t width, std::size_t height)
+{
+    const std::size_t pixels = width * height;
+
+    for (std::size_t i = 0, o = 0; i < pixels; i += 2, o += 4) {
+        const int a0 = src[(i + 0) * 4 + 3];
+        const int a1 = src[(i + 1) * 4 + 3];
+
+        // Convert full-range 8-bit alpha to legal-range luma.
+        const std::uint8_t y0 = static_cast<std::uint8_t>(16 + ((a0 * 219 + 127) / 255));
+        const std::uint8_t y1 = static_cast<std::uint8_t>(16 + ((a1 * 219 + 127) / 255));
+
+        dst[o + 0] = 128;
+        dst[o + 1] = y0;
+        dst[o + 2] = 128;
+        dst[o + 3] = y1;
+    }
+}
+
+void bgra_field_to_interlaced_key_uyvy(const std::uint8_t* src,
+                                       std::uint8_t*       dst,
+                                       int                 width,
+                                       int                 height,
+                                       int                 first_line)
+{
+    const int src_stride = width * 4;
+    const int dst_stride = width * 2;
+
+    for (int y = first_line; y < height; y += 2) {
+        bgra_to_key_uyvy(src + y * src_stride, dst + y * dst_stride, width, 1);
     }
 }
 
@@ -166,22 +198,32 @@ class aja_consumer final : public core::frame_consumer
     int                     channel_index_ = 0;
 
     std::vector<uint8_t>      video_buffer_;
+    std::vector<uint8_t>      key_buffer_;
     std::vector<std::int32_t> audio_buffer_;
 
     NTV2AudioSystem audio_system_ = NTV2_AUDIOSYSTEM_1;
 
     ULWord          device_index_ = 0;
     NTV2Channel     channel_      = NTV2_CHANNEL1;
+    NTV2Channel     key_channel_  = NTV2_CHANNEL_INVALID;
     NTV2VideoFormat video_format_ = NTV2_FORMAT_UNKNOWN;
+
+    bool key_enabled_ = false;
 
     bool   initialized_                = false;
     bool   auto_circulate_started_     = false;
     ULWord successful_frame_transfers_ = 0;
 
+    LWord fill_start_frame_ = -1;
+    LWord fill_end_frame_   = -1;
+    LWord next_fill_frame_  = -1;
+
   public:
-    aja_consumer(ULWord device_index, NTV2Channel channel)
+    aja_consumer(ULWord device_index, NTV2Channel channel, NTV2Channel key_channel = NTV2_CHANNEL_INVALID)
         : device_index_(device_index)
         , channel_(channel)
+        , key_channel_(key_channel)
+        , key_enabled_(key_channel != NTV2_CHANNEL_INVALID)
     {
     }
 
@@ -194,6 +236,9 @@ class aja_consumer final : public core::frame_consumer
             }
 
             device_.DisableChannel(channel_);
+
+            if (key_enabled_)
+                device_.DisableChannel(key_channel_);
         } catch (...) {
         }
     }
@@ -219,6 +264,9 @@ class aja_consumer final : public core::frame_consumer
 
         video_buffer_.resize(frame_buffer_size);
 
+        if (key_enabled_)
+            key_buffer_.resize(frame_buffer_size);
+
         CASPAR_LOG(info) << L"AJA consumer initializing for Caspar channel " << channel_index_ << L", AJA device "
                          << (device_index_ + 1) << L", output channel " << (static_cast<int>(channel_) + 1);
 
@@ -230,6 +278,22 @@ class aja_consumer final : public core::frame_consumer
 
         if (!device_.features().CanDoChannel(channel_)) {
             CASPAR_THROW_EXCEPTION(user_error() << msg_info("Selected AJA device does not support requested channel"));
+        }
+
+        if (key_enabled_) {
+            if (is_uhd) {
+                CASPAR_THROW_EXCEPTION(user_error() << msg_info("AJA fill/key output does not currently support UHD"));
+            }
+
+            if (static_cast<int>(key_channel_) != static_cast<int>(channel_) + 1) {
+                CASPAR_THROW_EXCEPTION(user_error()
+                                       << msg_info("AJA key channel must immediately follow fill channel"));
+            }
+
+            if (!device_.features().CanDoChannel(key_channel_)) {
+                CASPAR_THROW_EXCEPTION(user_error()
+                                       << msg_info("Selected AJA device does not support requested key channel"));
+            }
         }
 
         if (is_uhd && channel_ != NTV2_CHANNEL1) {
@@ -298,6 +362,27 @@ class aja_consumer final : public core::frame_consumer
                 CASPAR_THROW_EXCEPTION(caspar_exception()
                                        << msg_info("Unable to set AJA framebuffer format to 8-bit YCbCr"));
             }
+
+            if (key_enabled_) {
+                if (!device_.EnableChannel(key_channel_)) {
+                    CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to enable AJA key channel"));
+                }
+
+                device_.SetMode(key_channel_, NTV2_MODE_DISPLAY);
+
+                device_.SetVANCMode(NTV2_VANCMODE_OFF, key_channel_);
+
+                device_.SetVANCShiftMode(key_channel_, NTV2_VANCDATA_NORMAL);
+
+                if (!device_.SetVideoFormat(video_format_, false, false, key_channel_)) {
+                    CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set AJA key video format"));
+                }
+
+                if (!device_.SetFrameBufferFormat(key_channel_, kPixelFormat)) {
+                    CASPAR_THROW_EXCEPTION(caspar_exception()
+                                           << msg_info("Unable to set AJA key framebuffer format to 8-bit YCbCr"));
+                }
+            }
         }
 
         //
@@ -314,6 +399,16 @@ class aja_consumer final : public core::frame_consumer
         device_.SetSDIOutRGBLevelAConversion(channel_, false);
 
         device_.SetSDITransmitEnable(channel_, true);
+
+        if (key_enabled_) {
+            device_.SetSDIOutputStandard(key_channel_, video_std);
+
+            device_.SetSDIOutLevelAtoLevelBConversion(key_channel_, false);
+
+            device_.SetSDIOutRGBLevelAConversion(key_channel_, false);
+
+            device_.SetSDITransmitEnable(key_channel_, true);
+        }
 
         NTV2XptConnections connections;
 
@@ -361,6 +456,12 @@ class aja_consumer final : public core::frame_consumer
             const NTV2OutputXptID source_xpt = GetFrameStoreOutputXptFromChannel(channel_, false);
 
             connections.insert(NTV2XptConnection(GetSDIOutputInputXpt(channel_), source_xpt));
+
+            if (key_enabled_) {
+                const NTV2OutputXptID key_source_xpt = GetFrameStoreOutputXptFromChannel(key_channel_, false);
+
+                connections.insert(NTV2XptConnection(GetSDIOutputInputXpt(key_channel_), key_source_xpt));
+            }
         }
 
         if (!device_.ApplySignalRoute(connections, false)) {
@@ -408,15 +509,34 @@ class aja_consumer final : public core::frame_consumer
             device_.SetSDIOutputAudioSystem(audio_spigots, audio_system_);
         } else {
             device_.SetSDIOutputAudioSystem(channel_, audio_system_);
+            device_.SetSDIOutputAudioEnabled(channel_, true);
+
+            if (key_enabled_)
+                device_.SetSDIOutputAudioEnabled(key_channel_, false);
         }
 
         device_.SetSDIOutputDS2AudioSystem(channel_, audio_system_);
 
         device_.SetAudioLoopBack(NTV2_AUDIO_LOOPBACK_OFF, audio_system_);
 
-        if (!device_.AutoCirculateInitForOutput(channel_, 7, audio_system_, AUTOCIRCULATE_WITH_RP188)) {
+        const UByte auto_circulate_channels = key_enabled_ ? 2 : 1;
+
+        if (!device_.AutoCirculateInitForOutput(
+                channel_, 7, audio_system_, AUTOCIRCULATE_WITH_RP188, auto_circulate_channels)) {
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to initialize AJA AutoCirculate output"));
         }
+
+        AUTOCIRCULATE_STATUS ac_status;
+
+        if (!device_.AutoCirculateGetStatus(channel_, ac_status)) {
+            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to query AJA AutoCirculate status"));
+        }
+
+        fill_start_frame_ = ac_status.GetStartFrame();
+        fill_end_frame_   = ac_status.GetEndFrame();
+        next_fill_frame_  = fill_start_frame_;
+
+        CASPAR_LOG(info) << L"AJA AutoCirculate ring: " << fill_start_frame_ << L"-" << fill_end_frame_;
 
         auto_circulate_started_ = false;
         initialized_            = true;
@@ -463,6 +583,11 @@ class aja_consumer final : public core::frame_consumer
                 bgra_field_to_interlaced_uyvy(
                     image.data(), video_buffer_.data(), format_desc_.width, format_desc_.height, first_line);
 
+                if (key_enabled_) {
+                    bgra_field_to_interlaced_key_uyvy(
+                        image.data(), key_buffer_.data(), format_desc_.width, format_desc_.height, first_line);
+                }
+
                 if (field == core::video_field::a)
                     audio_buffer_.clear();
 
@@ -472,6 +597,10 @@ class aja_consumer final : public core::frame_consumer
                     return caspar::make_ready_future(true);
             } else {
                 bgra_to_uyvy(image.data(), video_buffer_.data(), format_desc_.width, format_desc_.height);
+
+                if (key_enabled_) {
+                    bgra_to_key_uyvy(image.data(), key_buffer_.data(), format_desc_.width, format_desc_.height);
+                }
 
                 audio_buffer_.assign(audio.begin(), audio.end());
             }
@@ -495,18 +624,41 @@ class aja_consumer final : public core::frame_consumer
                                         static_cast<ULWord>(audio_buffer_.size() * sizeof(std::int32_t)));
             }
 
+            if (key_enabled_) {
+                const LWord stride = fill_end_frame_ - fill_start_frame_ + 1;
+
+                const LWord key_device_frame = next_fill_frame_ + stride;
+
+                if (!device_.DMAWriteFrame(static_cast<ULWord>(key_device_frame),
+                                           reinterpret_cast<const ULWord*>(key_buffer_.data()),
+                                           static_cast<ULWord>(key_buffer_.size()))) {
+                    CASPAR_LOG(error) << L"AJA key DMAWriteFrame failed for device frame " << key_device_frame;
+
+                    return caspar::make_ready_future(false);
+                }
+
+                transfer.acDesiredFrame = next_fill_frame_;
+            }
+
             if (!device_.AutoCirculateTransfer(channel_, transfer)) {
                 CASPAR_LOG(error) << L"AJA AutoCirculateTransfer failed";
                 return caspar::make_ready_future(false);
             }
 
+            if (key_enabled_) {
+                if (next_fill_frame_ >= fill_end_frame_)
+                    next_fill_frame_ = fill_start_frame_;
+                else
+                    ++next_fill_frame_;
+            }
+
             ++successful_frame_transfers_;
 
-            if (!auto_circulate_started_ && successful_frame_transfers_ >= 3) {
+            if (!auto_circulate_started_ && successful_frame_transfers_ >= 5) {
                 if (!device_.AutoCirculateStart(channel_)) {
                     CASPAR_LOG(error) << L"Unable to start AJA AutoCirculate frame output";
 
-                    return caspar::make_ready_future(true);
+                    return caspar::make_ready_future(false);
                 }
 
                 auto_circulate_started_ = true;
@@ -558,8 +710,9 @@ create_preconfigured_consumer(const boost::property_tree::wptree&               
                               const std::vector<spl::shared_ptr<core::video_channel>>& channels,
                               const core::channel_info&                                channel_info)
 {
-    const int device  = ptree.get<int>(L"device", 1);
-    const int channel = ptree.get<int>(L"channel", 1);
+    const int device      = ptree.get<int>(L"device", 1);
+    const int channel     = ptree.get<int>(L"channel", 1);
+    const int key_channel = ptree.get<int>(L"key-channel", 0);
 
     if (device < 1) {
         CASPAR_THROW_EXCEPTION(user_error() << msg_info("AJA device must be >= 1"));
@@ -569,7 +722,15 @@ create_preconfigured_consumer(const boost::property_tree::wptree&               
         CASPAR_THROW_EXCEPTION(user_error() << msg_info("AJA channel must be >= 1"));
     }
 
-    return spl::make_shared<aja_consumer>(static_cast<ULWord>(device - 1), static_cast<NTV2Channel>(channel - 1));
+    if (key_channel < 0) {
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info("AJA key channel must be >= 1 when specified"));
+    }
+
+    const NTV2Channel aja_key_channel =
+        key_channel > 0 ? static_cast<NTV2Channel>(key_channel - 1) : NTV2_CHANNEL_INVALID;
+
+    return spl::make_shared<aja_consumer>(
+        static_cast<ULWord>(device - 1), static_cast<NTV2Channel>(channel - 1), aja_key_channel);
 }
 
 }} // namespace caspar::aja
