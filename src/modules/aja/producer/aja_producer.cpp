@@ -21,8 +21,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -37,6 +39,50 @@ constexpr NTV2FrameBufferFormat kPixelFormat         = NTV2_FBF_8BIT_YCBCR;
 constexpr ULWord                kAutoCirculateFrames = 7;
 constexpr ULWord                kAudioChannels       = 16;
 
+NTV2VideoFormat get_aja_video_format(core::video_format format)
+{
+    switch (format) {
+        case core::video_format::x1080i5000:
+            return NTV2_FORMAT_1080i_5000;
+        case core::video_format::x1080i5994:
+            return NTV2_FORMAT_1080i_5994;
+        case core::video_format::x1080i6000:
+            return NTV2_FORMAT_1080i_6000;
+        case core::video_format::x1080p2398:
+            return NTV2_FORMAT_1080p_2398;
+        case core::video_format::x1080p2400:
+            return NTV2_FORMAT_1080p_2400;
+        case core::video_format::x1080p2500:
+            return NTV2_FORMAT_1080p_2500;
+        case core::video_format::x1080p2997:
+            return NTV2_FORMAT_1080p_2997;
+        case core::video_format::x1080p3000:
+            return NTV2_FORMAT_1080p_3000;
+        case core::video_format::x1080p5000:
+            return NTV2_FORMAT_1080p_5000_A;
+        case core::video_format::x1080p5994:
+            return NTV2_FORMAT_1080p_5994_A;
+        case core::video_format::x1080p6000:
+            return NTV2_FORMAT_1080p_6000_A;
+        default:
+            return NTV2_FORMAT_UNKNOWN;
+    }
+}
+
+bool aja_format_matches_caspar_format(NTV2VideoFormat detected, core::video_format requested)
+{
+    switch (requested) {
+        case core::video_format::x1080p5000:
+            return detected == NTV2_FORMAT_1080p_5000_A || detected == NTV2_FORMAT_1080p_5000_B;
+        case core::video_format::x1080p5994:
+            return detected == NTV2_FORMAT_1080p_5994_A || detected == NTV2_FORMAT_1080p_5994_B;
+        case core::video_format::x1080p6000:
+            return detected == NTV2_FORMAT_1080p_6000_A || detected == NTV2_FORMAT_1080p_6000_B;
+        default:
+            return detected == get_aja_video_format(requested);
+    }
+}
+
 inline std::uint8_t clamp_byte(int value) { return static_cast<std::uint8_t>(std::max(0, std::min(255, value))); }
 
 void uyvy_to_bgra(const std::uint8_t* src, std::uint8_t* dst, std::size_t width, std::size_t height)
@@ -50,7 +96,7 @@ void uyvy_to_bgra(const std::uint8_t* src, std::uint8_t* dst, std::size_t width,
         const int y1 = static_cast<int>(src[o + 3]) - 16;
 
         const auto write_pixel = [&](std::size_t pixel, int y) {
-            y = std::max(0, y);
+            y           = std::max(0, y);
             const int c = 298 * y;
             const int r = (c + 459 * v + 128) >> 8;
             const int g = (c - 55 * u - 136 * v + 128) >> 8;
@@ -71,6 +117,8 @@ class aja_producer final : public core::frame_producer
 {
     const spl::shared_ptr<core::frame_factory> frame_factory_;
     const core::video_format_desc              channel_format_desc_;
+    const core::video_format_repository        format_repository_;
+    core::video_format_desc                    input_format_desc_;
 
     ULWord      device_index_ = 0;
     NTV2Channel channel_      = NTV2_CHANNEL1;
@@ -86,11 +134,20 @@ class aja_producer final : public core::frame_producer
     std::vector<std::uint8_t> capture_buffer_;
     std::vector<std::uint8_t> capture_audio_buffer_;
 
-    mutable std::mutex        frame_mutex_;
-    std::vector<std::uint8_t> latest_bgra_;
-    std::vector<std::int32_t> latest_audio_;
-    std::uint64_t             latest_sequence_ = 0;
-    bool                      have_frame_      = false;
+    struct captured_frame
+    {
+        std::vector<std::uint8_t> bgra;
+        std::vector<std::int32_t> audio;
+    };
+
+    static constexpr std::size_t kCaptureQueueCapacity        = 4;
+    static constexpr std::size_t kCaptureQueueStartupPrebuffer = 3;
+    static constexpr std::size_t kCaptureQueueRebuffer         = 2;
+
+    mutable std::mutex         frame_mutex_;
+    std::deque<captured_frame> capture_queue_;
+    bool                       capture_queue_primed_ = false;
+    std::size_t                capture_queue_prime_target_ = kCaptureQueueStartupPrebuffer;
 
     mutable std::mutex exception_mutex_;
     std::exception_ptr capture_exception_;
@@ -100,27 +157,48 @@ class aja_producer final : public core::frame_producer
 
     bool auto_circulate_started_ = false;
 
+    std::chrono::steady_clock::time_point capture_diag_started_ = std::chrono::steady_clock::now();
+    std::uint64_t capture_diag_transfers_ = 0;
+    std::uint64_t capture_diag_accepted_ = 0;
+    std::uint64_t capture_diag_rejected_ = 0;
+    std::uint64_t capture_diag_no_frame_polls_ = 0;
+
+    std::chrono::steady_clock::time_point last_no_frame_signal_check_ =
+        std::chrono::steady_clock::now();
+
     static constexpr unsigned kCleanFramesAfterReacquire = 3;
     bool                      signal_was_good_           = true;
     unsigned                  clean_reacquire_frames_    = kCleanFramesAfterReacquire;
 
     core::draw_frame latched_frame_a_;
     core::draw_frame latched_frame_b_;
-    std::uint64_t    latched_sequence_ = 0;
     bool             deliver_b_audio_  = false;
+    bool             interlaced_second_half_ = false;
+    std::atomic_bool interlaced_phase_reset_requested_{false};
 
     core::monitor::state state_;
 
   public:
     aja_producer(const spl::shared_ptr<core::frame_factory>& frame_factory,
                  const core::video_format_desc&              channel_format_desc,
+                 const core::video_format_repository&        format_repository,
                  ULWord                                      device_index,
-                 NTV2Channel                                 channel)
+                 NTV2Channel                                 channel,
+                 const std::wstring&                         format)
         : frame_factory_(frame_factory)
         , channel_format_desc_(channel_format_desc)
+        , format_repository_(format_repository)
         , device_index_(device_index)
         , channel_(channel)
     {
+        if (format.empty())
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info("AJA FORMAT parameter is required"));
+
+        input_format_desc_ = format_repository_.find(format);
+
+        if (input_format_desc_.format == core::video_format::invalid)
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info("Unknown AJA input FORMAT"));
+
         initialize();
         capture_thread_ = std::thread([this] { capture_loop(); });
     }
@@ -151,28 +229,50 @@ class aja_producer final : public core::frame_producer
     {
         rethrow_capture_exception();
 
-        if (channel_format_desc_.field_count == 2) {
-            if (field == core::video_field::a || !latched_frame_a_) {
+        if (input_format_desc_.field_count == 2) {
+            if (interlaced_phase_reset_requested_.exchange(false)) {
+                interlaced_second_half_ = false;
+                deliver_b_audio_        = false;
+            }
+
+            // Caspar currently reaches this producer with video_field == 0 for
+            // every 1080i callback, so field cannot be used to select A/B.
+            // Drive the two-half delivery explicitly:
+            //   first callback  -> pop one complete 25 Hz capture, return A
+            //   second callback -> reuse that capture, return B
+            //
+            // Startup/probe calls use nb_samples == 0. They must not consume
+            // FIFO entries or advance the A/B phase.
+            if (nb_samples <= 0)
+                return latched_frame_a_ ? core::draw_frame::still(latched_frame_a_)
+                                        : core::draw_frame::empty();
+
+            if (!interlaced_second_half_ || !latched_frame_a_) {
                 const bool new_pair = latch_latest_pair(nb_samples);
                 deliver_b_audio_    = new_pair;
 
-                return latched_frame_a_
-                           ? (new_pair ? latched_frame_a_ : core::draw_frame::still(latched_frame_a_))
-                           : core::draw_frame::empty();
+                if (!new_pair) {
+                    interlaced_second_half_ = false;
+                    return latched_frame_a_ ? core::draw_frame::still(latched_frame_a_)
+                                            : core::draw_frame::empty();
+                }
+
+                interlaced_second_half_ = true;
+                return latched_frame_a_;
             }
 
             const bool with_audio = deliver_b_audio_;
             deliver_b_audio_      = false;
+            interlaced_second_half_ = false;
 
-            return latched_frame_b_
-                       ? (with_audio ? latched_frame_b_ : core::draw_frame::still(latched_frame_b_))
-                       : core::draw_frame::empty();
+            return latched_frame_b_ ? (with_audio ? latched_frame_b_ : core::draw_frame::still(latched_frame_b_))
+                                    : core::draw_frame::empty();
         }
 
         const bool new_frame = latch_latest_pair(nb_samples);
-        return latched_frame_a_
-                   ? (new_frame ? latched_frame_a_ : core::draw_frame::still(latched_frame_a_))
-                   : core::draw_frame::empty();
+
+        return latched_frame_a_ ? (new_frame ? latched_frame_a_ : core::draw_frame::still(latched_frame_a_))
+                                : core::draw_frame::empty();
     }
 
     core::draw_frame first_frame(const core::video_field field) override { return receive_impl(field, 0); }
@@ -190,24 +290,25 @@ class aja_producer final : public core::frame_producer
         rethrow_capture_exception();
 
         std::lock_guard<std::mutex> lock(frame_mutex_);
-        return have_frame_;
+        return (capture_queue_primed_ && !capture_queue_.empty()) || static_cast<bool>(latched_frame_a_);
     }
 
     std::wstring print() const override
     {
         return L"AJA input [" + std::to_wstring(device_index_ + 1) + L"|" +
-               std::to_wstring(static_cast<int>(channel_) + 1) + L"|1080i5000]";
+               std::to_wstring(static_cast<int>(channel_) + 1) + L"|" + input_format_desc_.name + L"]";
     }
 
-    std::wstring name() const override { return L"aja"; }
+    std::wstring         name() const override { return L"aja"; }
     core::monitor::state state() const override { return state_; }
 
   private:
     void initialize()
     {
-        if (channel_format_desc_.format != core::video_format::x1080i5000) {
+        const NTV2VideoFormat expected_format = get_aja_video_format(input_format_desc_.format);
+        if (expected_format == NTV2_FORMAT_UNKNOWN) {
             CASPAR_THROW_EXCEPTION(user_error()
-                                   << msg_info("Initial AJA input producer requires a 1080i5000 CasparCG channel"));
+                                   << msg_info("AJA input producer currently supports 1080 HD formats only"));
         }
 
         CNTV2DeviceScanner scanner(true);
@@ -219,12 +320,14 @@ class aja_producer final : public core::frame_producer
             CASPAR_THROW_EXCEPTION(user_error() << msg_info("Selected AJA device does not support capture"));
 
         if (!device_.features().CanDoChannel(channel_))
-            CASPAR_THROW_EXCEPTION(user_error() << msg_info("Selected AJA device does not support requested input channel"));
+            CASPAR_THROW_EXCEPTION(user_error()
+                                   << msg_info("Selected AJA device does not support requested input channel"));
 
         input_source_ = ::NTV2ChannelToInputSource(channel_, NTV2_IOKINDS_SDI);
 
         if (!device_.features().CanDoInputSource(input_source_))
-            CASPAR_THROW_EXCEPTION(user_error() << msg_info("Selected AJA device does not provide requested SDI input"));
+            CASPAR_THROW_EXCEPTION(user_error()
+                                   << msg_info("Selected AJA device does not provide requested SDI input"));
 
         device_.SetEveryFrameServices(NTV2_OEM_TASKS);
 
@@ -239,25 +342,60 @@ class aja_producer final : public core::frame_producer
                 device_.WaitForInputVerticalInterrupt(channel_);
         }
 
+        bool is_3gb = false;
+        device_.GetSDIInput3GbPresent(is_3gb, channel_);
+
         input_format_ = device_.GetInputVideoFormat(input_source_);
 
         if (input_format_ == NTV2_FORMAT_UNKNOWN)
-            CASPAR_THROW_EXCEPTION(user_error() << msg_info("No signal or unknown video format on selected AJA SDI input"));
+            CASPAR_THROW_EXCEPTION(user_error()
+                                   << msg_info("No signal or unknown video format on selected AJA SDI input"));
 
-        if (input_format_ != NTV2_FORMAT_1080i_5000)
-            CASPAR_THROW_EXCEPTION(user_error() << msg_info("Initial AJA input producer supports 1080i5000 input only"));
+        if (!aja_format_matches_caspar_format(input_format_, input_format_desc_.format))
+            CASPAR_THROW_EXCEPTION(user_error() << msg_info("AJA SDI input format does not match requested FORMAT"));
 
         if (!device_.features().CanDoVideoFormat(input_format_))
-            CASPAR_THROW_EXCEPTION(user_error() << msg_info("Selected AJA device cannot capture detected video format"));
+            CASPAR_THROW_EXCEPTION(user_error()
+                                   << msg_info("Selected AJA device cannot capture detected video format"));
 
-        if (!device_.SetVideoFormat(input_format_, false, false, channel_))
+        NTV2VideoFormat capture_format = input_format_;
+        bool            level_b_to_a   = false;
+
+        switch (input_format_) {
+            case NTV2_FORMAT_1080p_5000_B:
+                capture_format = NTV2_FORMAT_1080p_5000_A;
+                level_b_to_a   = true;
+                break;
+            case NTV2_FORMAT_1080p_5994_B:
+                capture_format = NTV2_FORMAT_1080p_5994_A;
+                level_b_to_a   = true;
+                break;
+            case NTV2_FORMAT_1080p_6000_B:
+                capture_format = NTV2_FORMAT_1080p_6000_A;
+                level_b_to_a   = true;
+                break;
+            default:
+                break;
+        }
+
+        if (!device_.features().CanDoVideoFormat(capture_format))
+            CASPAR_THROW_EXCEPTION(user_error()
+                                   << msg_info("Selected AJA device cannot capture normalized video format"));
+
+        if (!device_.SetVideoFormat(capture_format, false, false, channel_))
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set AJA input video format"));
+
+        device_.SetSDIInLevelBtoLevelAConversion(channel_, level_b_to_a);
+
+        CASPAR_LOG(info) << print() << L" SDI 3G input detected: " << (is_3gb ? L"yes" : L"no")
+                         << L"; Level B to Level A conversion: " << (level_b_to_a ? L"enabled" : L"disabled");
 
         device_.SetVANCMode(NTV2_VANCMODE_OFF, channel_);
         device_.SetVANCShiftMode(channel_, NTV2_VANCDATA_NORMAL);
 
         if (!device_.SetFrameBufferFormat(channel_, kPixelFormat))
-            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set AJA input framebuffer to 8-bit YCbCr"));
+            CASPAR_THROW_EXCEPTION(caspar_exception()
+                                   << msg_info("Unable to set AJA input framebuffer to 8-bit YCbCr"));
 
         audio_system_ = NTV2_AUDIOSYSTEM_1;
         if (device_.features().GetNumAudioSystems() > 1)
@@ -286,28 +424,70 @@ class aja_producer final : public core::frame_producer
         connections.insert(NTV2XptConnection(frame_store_xpt, input_xpt));
 
         if (!device_.ApplySignalRoute(connections, false))
-            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to route selected AJA SDI input to FrameStore"));
+            CASPAR_THROW_EXCEPTION(caspar_exception()
+                                   << msg_info("Unable to route selected AJA SDI input to FrameStore"));
 
-        const NTV2FormatDescriptor format_desc(input_format_, kPixelFormat);
+        const NTV2FormatDescriptor format_desc(capture_format, kPixelFormat);
         width_  = static_cast<std::size_t>(format_desc.GetRasterWidth());
         height_ = static_cast<std::size_t>(format_desc.GetRasterHeight());
 
-        if (width_ != 1920 || height_ != 1080)
-            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unexpected raster size for AJA 1080i5000 input"));
+        if (width_ != static_cast<std::size_t>(channel_format_desc_.width) ||
+            height_ != static_cast<std::size_t>(channel_format_desc_.height))
+            CASPAR_THROW_EXCEPTION(caspar_exception()
+                                   << msg_info("AJA input raster size does not match the CasparCG channel"));
 
         capture_buffer_.resize(static_cast<std::size_t>(format_desc.GetVideoWriteSize()));
         capture_audio_buffer_.resize(256 * 1024);
-        latest_bgra_.resize(width_ * height_ * 4u);
 
-        state_["device"]                = static_cast<int64_t>(device_index_ + 1);
-        state_["channel"]               = static_cast<int64_t>(static_cast<int>(channel_) + 1);
-        state_["format"]                = std::wstring(L"1080i5000");
-        state_["audio/sample-rate"]     = static_cast<int64_t>(48000);
-        state_["audio/channels"]        = static_cast<int64_t>(kAudioChannels);
+        state_["device"]            = static_cast<int64_t>(device_index_ + 1);
+        state_["channel"]           = static_cast<int64_t>(static_cast<int>(channel_) + 1);
+        state_["format"]            = input_format_desc_.name;
+        state_["audio/sample-rate"] = static_cast<int64_t>(48000);
+        state_["audio/channels"]    = static_cast<int64_t>(kAudioChannels);
 
         CASPAR_LOG(info) << L"AJA producer initialized: device " << (device_index_ + 1) << L", input channel "
-                         << (static_cast<int>(channel_) + 1)
-                         << L", detected 1080i5000, 16-channel 48 kHz embedded audio";
+                         << (static_cast<int>(channel_) + 1) << L", detected " << input_format_desc_.name
+                         << L", 16-channel 48 kHz embedded audio";
+    }
+
+    void report_capture_diagnostics_if_due()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - capture_diag_started_ < std::chrono::seconds(1))
+            return;
+
+        std::size_t queue_depth = 0;
+        bool queue_primed = false;
+        {
+            std::lock_guard<std::mutex> lock(frame_mutex_);
+            queue_depth = capture_queue_.size();
+            queue_primed = capture_queue_primed_;
+        }
+
+        CASPAR_LOG(info) << print()
+                         << L" capture accounting: transfers=" << capture_diag_transfers_
+                         << L", accepted=" << capture_diag_accepted_
+                         << L", rejected=" << capture_diag_rejected_
+                         << L", no-frame-polls=" << capture_diag_no_frame_polls_
+                         << L", queue=" << queue_depth << L"/" << kCaptureQueueCapacity
+                         << L", state=" << (queue_primed ? L"running" : L"buffering");
+
+        capture_diag_transfers_ = capture_diag_accepted_ = capture_diag_rejected_ = capture_diag_no_frame_polls_ = 0;
+        capture_diag_started_ = now;
+    }
+
+    void monitor_signal_without_frame()
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_no_frame_signal_check_ < std::chrono::milliseconds(100))
+            return;
+
+        last_no_frame_signal_check_ = now;
+
+        // AutoCirculate can legitimately have no transferable frame when SDI
+        // disappears. Probe receiver state independently so signal-loss
+        // detection does not depend on a successful transfer.
+        (void)input_frame_is_stable();
     }
 
     void capture_loop()
@@ -340,10 +520,16 @@ class aja_producer final : public core::frame_producer
                         continue;
                     }
 
-                    if (!input_frame_is_stable())
-                        continue;
+                    ++capture_diag_transfers_;
 
-                    const ULWord audio_bytes           = transfer.GetCapturedAudioByteCount();
+                    if (!input_frame_is_stable()) {
+                        ++capture_diag_rejected_;
+                        report_capture_diagnostics_if_due();
+                        continue;
+                    }
+                    ++capture_diag_accepted_;
+
+                    const ULWord audio_bytes            = transfer.GetCapturedAudioByteCount();
                     const ULWord bytes_per_sample_frame = kAudioChannels * sizeof(std::int32_t);
 
                     if (audio_bytes == 0 || audio_bytes > capture_audio_buffer_.size() ||
@@ -355,16 +541,43 @@ class aja_producer final : public core::frame_producer
                     std::vector<std::uint8_t> converted(width_ * height_ * 4u);
                     uyvy_to_bgra(capture_buffer_.data(), converted.data(), width_, height_);
 
+                    captured_frame captured;
+                    captured.bgra.swap(converted);
+                    captured.audio.resize(audio_bytes / sizeof(std::int32_t));
+                    std::memcpy(captured.audio.data(), capture_audio_buffer_.data(), audio_bytes);
+
                     {
                         std::lock_guard<std::mutex> lock(frame_mutex_);
-                        latest_bgra_.swap(converted);
-                        latest_audio_.resize(audio_bytes / sizeof(std::int32_t));
-                        std::memcpy(latest_audio_.data(), capture_audio_buffer_.data(), audio_bytes);
-                        ++latest_sequence_;
-                        have_frame_ = true;
+
+                        capture_queue_.emplace_back(std::move(captured));
+
+                        if (capture_queue_.size() > kCaptureQueueCapacity) {
+                            capture_queue_.pop_front();
+                            CASPAR_LOG(info) << print()
+                                             << L" capture queue: overflow; dropped oldest frame";
+                        }
+
+                        if (!capture_queue_primed_ &&
+                            capture_queue_.size() >= capture_queue_prime_target_) {
+                            capture_queue_primed_ = true;
+                            CASPAR_LOG(info) << print()
+                                             << (capture_queue_prime_target_ == kCaptureQueueStartupPrebuffer
+                                                     ? L" capture queue: primed "
+                                                     : L" capture queue: rebuffered ")
+                                             << capture_queue_.size() << L"/"
+                                             << kCaptureQueueCapacity;
+                        }
                     }
+
+                    report_capture_diagnostics_if_due();
                 } else {
-                    device_.WaitForInputVerticalInterrupt(channel_);
+                    ++capture_diag_no_frame_polls_;
+                    monitor_signal_without_frame();
+                    report_capture_diagnostics_if_due();
+
+                    // Do not wait for the next vertical here: a frame can become available
+                    // between the status query and the wait, costing an extra frame period.
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 }
             }
 
@@ -394,12 +607,19 @@ class aja_producer final : public core::frame_producer
         const bool          have_sdi_status =
             device_.ReadSDIStatistics(stats) && stats.GetSDIInputStatus(input_status, static_cast<UWord>(channel_));
 
-        const bool receiver_good = detected_format == NTV2_FORMAT_1080i_5000 && have_sdi_status &&
-                                   input_status.mLocked && !input_status.mFrameTRSError;
+        const bool receiver_good =
+            detected_format == input_format_ && have_sdi_status && input_status.mLocked && !input_status.mFrameTRSError;
 
         if (!receiver_good) {
-            if (signal_was_good_)
+            if (signal_was_good_) {
                 CASPAR_LOG(info) << print() << L" SDI signal lost/unstable; holding last good frame";
+
+                std::lock_guard<std::mutex> lock(frame_mutex_);
+                capture_queue_.clear();
+                capture_queue_primed_       = false;
+                capture_queue_prime_target_ = kCaptureQueueStartupPrebuffer;
+                interlaced_phase_reset_requested_.store(true);
+            }
 
             signal_was_good_        = false;
             clean_reacquire_frames_ = 0;
@@ -420,9 +640,8 @@ class aja_producer final : public core::frame_producer
         return true;
     }
 
-    core::draw_frame make_caspar_frame(const std::vector<std::uint8_t>& bgra,
-                                       const std::int32_t*              audio,
-                                       std::size_t                      audio_values)
+    core::draw_frame
+    make_caspar_frame(const std::vector<std::uint8_t>& bgra, const std::int32_t* audio, std::size_t audio_values)
     {
         core::pixel_format_desc pixel_desc(core::pixel_format::bgra, core::color_space::bt709);
         pixel_desc.planes.emplace_back(static_cast<int>(width_), static_cast<int>(height_), 4);
@@ -443,50 +662,67 @@ class aja_producer final : public core::frame_producer
 
     bool latch_latest_pair(int requested_samples_per_field)
     {
-        std::vector<std::uint8_t> bgra;
-        std::vector<std::int32_t> audio;
-        std::uint64_t             sequence = 0;
+        captured_frame captured;
 
         {
             std::lock_guard<std::mutex> lock(frame_mutex_);
 
-            if (!have_frame_)
+            if (!capture_queue_primed_)
                 return false;
 
-            if (latched_frame_a_ && latest_sequence_ == latched_sequence_)
+            if (capture_queue_.empty()) {
+                if (signal_was_good_ && latched_frame_a_) {
+                    CASPAR_LOG(info) << print()
+                                     << L" capture queue: unexpected underflow; rebuffering";
+                }
+                capture_queue_primed_       = false;
+                capture_queue_prime_target_ = kCaptureQueueRebuffer;
                 return false;
+            }
 
-            bgra     = latest_bgra_;
-            audio    = latest_audio_;
-            sequence = latest_sequence_;
+            captured = std::move(capture_queue_.front());
+            capture_queue_.pop_front();
         }
 
+        auto& bgra  = captured.bgra;
+        auto& audio = captured.audio;
+
         const std::size_t captured_sample_frames = audio.size() / kAudioChannels;
+
         const std::size_t requested =
             requested_samples_per_field > 0 ? static_cast<std::size_t>(requested_samples_per_field) : 0u;
 
-        std::vector<std::int32_t> audio_a(requested * kAudioChannels, 0);
-        std::vector<std::int32_t> audio_b(requested * kAudioChannels, 0);
+        if (input_format_desc_.field_count == 2) {
+            std::vector<std::int32_t> audio_a(requested * kAudioChannels, 0);
+            std::vector<std::int32_t> audio_b(requested * kAudioChannels, 0);
 
-        const std::size_t copy_a_frames = std::min(requested, captured_sample_frames);
-        if (copy_a_frames) {
-            std::memcpy(audio_a.data(),
-                        audio.data(),
-                        copy_a_frames * kAudioChannels * sizeof(std::int32_t));
+            const std::size_t copy_a_frames = std::min(requested, captured_sample_frames);
+            if (copy_a_frames) {
+                std::memcpy(audio_a.data(), audio.data(), copy_a_frames * kAudioChannels * sizeof(std::int32_t));
+            }
+
+            const std::size_t remaining_frames =
+                captured_sample_frames > copy_a_frames ? captured_sample_frames - copy_a_frames : 0u;
+            const std::size_t copy_b_frames = std::min(requested, remaining_frames);
+            if (copy_b_frames) {
+                std::memcpy(audio_b.data(),
+                            audio.data() + copy_a_frames * kAudioChannels,
+                            copy_b_frames * kAudioChannels * sizeof(std::int32_t));
+            }
+
+            latched_frame_a_ = make_caspar_frame(bgra, audio_a.data(), audio_a.size());
+            latched_frame_b_ = make_caspar_frame(bgra, audio_b.data(), audio_b.size());
+        } else {
+            std::vector<std::int32_t> audio_frame(requested * kAudioChannels, 0);
+            const std::size_t         copy_frames = std::min(requested, captured_sample_frames);
+
+            if (copy_frames) {
+                std::memcpy(audio_frame.data(), audio.data(), copy_frames * kAudioChannels * sizeof(std::int32_t));
+            }
+
+            latched_frame_a_ = make_caspar_frame(bgra, audio_frame.data(), audio_frame.size());
+            latched_frame_b_ = core::draw_frame::empty();
         }
-
-        const std::size_t remaining_frames =
-            captured_sample_frames > copy_a_frames ? captured_sample_frames - copy_a_frames : 0u;
-        const std::size_t copy_b_frames = std::min(requested, remaining_frames);
-        if (copy_b_frames) {
-            std::memcpy(audio_b.data(),
-                        audio.data() + copy_a_frames * kAudioChannels,
-                        copy_b_frames * kAudioChannels * sizeof(std::int32_t));
-        }
-
-        latched_frame_a_ = make_caspar_frame(bgra, audio_a.data(), audio_a.size());
-        latched_frame_b_ = make_caspar_frame(bgra, audio_b.data(), audio_b.size());
-        latched_sequence_ = sequence;
         return true;
     }
 
@@ -512,8 +748,12 @@ spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer
     if (params.empty() || !boost::iequals(params.at(0), L"AJA"))
         return core::frame_producer::empty();
 
-    const int device_number  = get_param(L"DEVICE", params, 1);
-    const int channel_number = get_param(L"CHANNEL", params, 1);
+    const int  device_number  = get_param(L"DEVICE", params, 1);
+    const int  channel_number = get_param(L"CHANNEL", params, 1);
+    const auto format         = get_param(L"FORMAT", params);
+
+    if (format.empty())
+        CASPAR_THROW_EXCEPTION(user_error() << msg_info("AJA FORMAT parameter is required"));
 
     if (device_number < 1)
         CASPAR_THROW_EXCEPTION(user_error() << msg_info("AJA DEVICE must be 1 or greater"));
@@ -523,8 +763,10 @@ spl::shared_ptr<core::frame_producer> create_producer(const core::frame_producer
 
     return spl::make_shared<aja_producer>(dependencies.frame_factory,
                                           dependencies.format_desc,
+                                          dependencies.format_repository,
                                           static_cast<ULWord>(device_number - 1),
-                                          static_cast<NTV2Channel>(channel_number - 1));
+                                          static_cast<NTV2Channel>(channel_number - 1),
+                                          format);
 }
 
 }} // namespace caspar::aja
