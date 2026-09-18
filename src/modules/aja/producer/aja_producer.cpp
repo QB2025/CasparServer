@@ -138,11 +138,25 @@ class aja_producer final : public core::frame_producer
     {
         std::vector<std::uint8_t> bgra;
         std::vector<std::int32_t> audio;
+        std::uint64_t             generation = 0;
+        std::uint64_t             sequence   = 0;
     };
 
+    struct raw_captured_frame
+    {
+        std::vector<std::uint8_t> uyvy;
+        std::vector<std::int32_t> audio;
+        std::uint64_t             generation = 0;
+        std::uint64_t             sequence   = 0;
+    };
+
+    static constexpr std::size_t kRawQueueCapacity            = 4;
     static constexpr std::size_t kCaptureQueueCapacity        = 4;
     static constexpr std::size_t kCaptureQueueStartupPrebuffer = 3;
     static constexpr std::size_t kCaptureQueueRebuffer         = 2;
+
+    mutable std::mutex             raw_mutex_;
+    std::deque<raw_captured_frame> raw_queue_;
 
     mutable std::mutex         frame_mutex_;
     std::deque<captured_frame> capture_queue_;
@@ -152,16 +166,13 @@ class aja_producer final : public core::frame_producer
     mutable std::mutex exception_mutex_;
     std::exception_ptr capture_exception_;
 
-    std::atomic<bool> stop_requested_{false};
-    std::thread       capture_thread_;
+    std::atomic<bool>          stop_requested_{false};
+    std::atomic<std::uint64_t> capture_generation_{0};
+    std::atomic<std::uint64_t> capture_sequence_{0};
+    std::thread                capture_thread_;
+    std::thread                conversion_thread_;
 
     bool auto_circulate_started_ = false;
-
-    std::chrono::steady_clock::time_point capture_diag_started_ = std::chrono::steady_clock::now();
-    std::uint64_t capture_diag_transfers_ = 0;
-    std::uint64_t capture_diag_accepted_ = 0;
-    std::uint64_t capture_diag_rejected_ = 0;
-    std::uint64_t capture_diag_no_frame_polls_ = 0;
 
     std::chrono::steady_clock::time_point last_no_frame_signal_check_ =
         std::chrono::steady_clock::now();
@@ -170,11 +181,20 @@ class aja_producer final : public core::frame_producer
     bool                      signal_was_good_           = true;
     unsigned                  clean_reacquire_frames_    = kCleanFramesAfterReacquire;
 
+    // Passive SDI receiver diagnostics. These counters are observational only:
+    // they never reject a frame or alter capture/recovery behavior.
+    ULWord sdi_diag_unlock_count_ = 0;
+    ULWord sdi_diag_crc_a_        = 0;
+    ULWord sdi_diag_crc_b_        = 0;
+    bool   sdi_diag_initialized_  = false;
+
     core::draw_frame latched_frame_a_;
     core::draw_frame latched_frame_b_;
     bool             deliver_b_audio_  = false;
     bool             interlaced_second_half_ = false;
     std::atomic_bool interlaced_phase_reset_requested_{false};
+    std::uint64_t    last_latched_generation_ = 0;
+    std::uint64_t    last_latched_sequence_   = 0;
 
     core::monitor::state state_;
 
@@ -200,7 +220,8 @@ class aja_producer final : public core::frame_producer
             CASPAR_THROW_EXCEPTION(user_error() << msg_info("Unknown AJA input FORMAT"));
 
         initialize();
-        capture_thread_ = std::thread([this] { capture_loop(); });
+        conversion_thread_ = std::thread([this] { conversion_loop(); });
+        capture_thread_    = std::thread([this] { capture_loop(); });
     }
 
     ~aja_producer() override
@@ -215,6 +236,8 @@ class aja_producer final : public core::frame_producer
 
         if (capture_thread_.joinable())
             capture_thread_.join();
+        if (conversion_thread_.joinable())
+            conversion_thread_.join();
 
         try {
             device_.AutoCirculateStop(channel_);
@@ -439,6 +462,16 @@ class aja_producer final : public core::frame_producer
         capture_buffer_.resize(static_cast<std::size_t>(format_desc.GetVideoWriteSize()));
         capture_audio_buffer_.resize(256 * 1024);
 
+        sdi_diag_unlock_count_ = device_.GetSDIUnlockCount(channel_);
+        sdi_diag_crc_a_        = device_.GetCRCErrorCountA(channel_);
+        sdi_diag_crc_b_        = device_.GetCRCErrorCountB(channel_);
+        sdi_diag_initialized_  = true;
+
+        CASPAR_LOG(info) << print()
+                         << L" SDI diagnostics baseline: unlocks=" << sdi_diag_unlock_count_
+                         << L", CRC-A=" << sdi_diag_crc_a_
+                         << L", CRC-B=" << sdi_diag_crc_b_;
+
         state_["device"]            = static_cast<int64_t>(device_index_ + 1);
         state_["channel"]           = static_cast<int64_t>(static_cast<int>(channel_) + 1);
         state_["format"]            = input_format_desc_.name;
@@ -450,30 +483,34 @@ class aja_producer final : public core::frame_producer
                          << L", 16-channel 48 kHz embedded audio";
     }
 
-    void report_capture_diagnostics_if_due()
+    void monitor_sdi_diagnostics()
     {
-        const auto now = std::chrono::steady_clock::now();
-        if (now - capture_diag_started_ < std::chrono::seconds(1))
-            return;
+        const ULWord unlock_count = device_.GetSDIUnlockCount(channel_);
+        const ULWord crc_a        = device_.GetCRCErrorCountA(channel_);
+        const ULWord crc_b        = device_.GetCRCErrorCountB(channel_);
 
-        std::size_t queue_depth = 0;
-        bool queue_primed = false;
-        {
-            std::lock_guard<std::mutex> lock(frame_mutex_);
-            queue_depth = capture_queue_.size();
-            queue_primed = capture_queue_primed_;
+        if (!sdi_diag_initialized_) {
+            sdi_diag_unlock_count_ = unlock_count;
+            sdi_diag_crc_a_        = crc_a;
+            sdi_diag_crc_b_        = crc_b;
+            sdi_diag_initialized_  = true;
+            return;
         }
 
-        CASPAR_LOG(info) << print()
-                         << L" capture accounting: transfers=" << capture_diag_transfers_
-                         << L", accepted=" << capture_diag_accepted_
-                         << L", rejected=" << capture_diag_rejected_
-                         << L", no-frame-polls=" << capture_diag_no_frame_polls_
-                         << L", queue=" << queue_depth << L"/" << kCaptureQueueCapacity
-                         << L", state=" << (queue_primed ? L"running" : L"buffering");
+        if (unlock_count == sdi_diag_unlock_count_ &&
+            crc_a == sdi_diag_crc_a_ &&
+            crc_b == sdi_diag_crc_b_)
+            return;
 
-        capture_diag_transfers_ = capture_diag_accepted_ = capture_diag_rejected_ = capture_diag_no_frame_polls_ = 0;
-        capture_diag_started_ = now;
+        CASPAR_LOG(warning) << print()
+                            << L" SDI diagnostics changed: unlocks="
+                            << sdi_diag_unlock_count_ << L"->" << unlock_count
+                            << L", CRC-A=" << sdi_diag_crc_a_ << L"->" << crc_a
+                            << L", CRC-B=" << sdi_diag_crc_b_ << L"->" << crc_b;
+
+        sdi_diag_unlock_count_ = unlock_count;
+        sdi_diag_crc_a_        = crc_a;
+        sdi_diag_crc_b_        = crc_b;
     }
 
     void monitor_signal_without_frame()
@@ -488,6 +525,7 @@ class aja_producer final : public core::frame_producer
         // disappears. Probe receiver state independently so signal-loss
         // detection does not depend on a successful transfer.
         (void)input_frame_is_stable();
+        monitor_sdi_diagnostics();
     }
 
     void capture_loop()
@@ -520,14 +558,10 @@ class aja_producer final : public core::frame_producer
                         continue;
                     }
 
-                    ++capture_diag_transfers_;
-
-                    if (!input_frame_is_stable()) {
-                        ++capture_diag_rejected_;
-                        report_capture_diagnostics_if_due();
+                    if (!input_frame_is_stable())
                         continue;
-                    }
-                    ++capture_diag_accepted_;
+
+                    monitor_sdi_diagnostics();
 
                     const ULWord audio_bytes            = transfer.GetCapturedAudioByteCount();
                     const ULWord bytes_per_sample_frame = kAudioChannels * sizeof(std::int32_t);
@@ -538,42 +572,27 @@ class aja_producer final : public core::frame_producer
                         continue;
                     }
 
-                    std::vector<std::uint8_t> converted(width_ * height_ * 4u);
-                    uyvy_to_bgra(capture_buffer_.data(), converted.data(), width_, height_);
+                    raw_captured_frame raw;
+                    raw.generation = capture_generation_.load(std::memory_order_acquire);
+                    raw.sequence   = capture_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
+                    raw.uyvy.resize(capture_buffer_.size());
+                    std::memcpy(raw.uyvy.data(), capture_buffer_.data(), capture_buffer_.size());
+                    raw.audio.resize(audio_bytes / sizeof(std::int32_t));
+                    std::memcpy(raw.audio.data(), capture_audio_buffer_.data(), audio_bytes);
 
-                    captured_frame captured;
-                    captured.bgra.swap(converted);
-                    captured.audio.resize(audio_bytes / sizeof(std::int32_t));
-                    std::memcpy(captured.audio.data(), capture_audio_buffer_.data(), audio_bytes);
 
                     {
-                        std::lock_guard<std::mutex> lock(frame_mutex_);
-
-                        capture_queue_.emplace_back(std::move(captured));
-
-                        if (capture_queue_.size() > kCaptureQueueCapacity) {
-                            capture_queue_.pop_front();
+                        std::lock_guard<std::mutex> lock(raw_mutex_);
+                        raw_queue_.emplace_back(std::move(raw));
+                        if (raw_queue_.size() > kRawQueueCapacity) {
+                            raw_queue_.pop_front();
                             CASPAR_LOG(info) << print()
-                                             << L" capture queue: overflow; dropped oldest frame";
-                        }
-
-                        if (!capture_queue_primed_ &&
-                            capture_queue_.size() >= capture_queue_prime_target_) {
-                            capture_queue_primed_ = true;
-                            CASPAR_LOG(info) << print()
-                                             << (capture_queue_prime_target_ == kCaptureQueueStartupPrebuffer
-                                                     ? L" capture queue: primed "
-                                                     : L" capture queue: rebuffered ")
-                                             << capture_queue_.size() << L"/"
-                                             << kCaptureQueueCapacity;
+                                             << L" raw capture queue: overflow; dropped oldest frame";
                         }
                     }
 
-                    report_capture_diagnostics_if_due();
                 } else {
-                    ++capture_diag_no_frame_polls_;
                     monitor_signal_without_frame();
-                    report_capture_diagnostics_if_due();
 
                     // Do not wait for the next vertical here: a frame can become available
                     // between the status query and the wait, costing an extra frame period.
@@ -598,6 +617,79 @@ class aja_producer final : public core::frame_producer
         }
     }
 
+    void conversion_loop()
+    {
+        try {
+            while (!stop_requested_) {
+                raw_captured_frame raw;
+                bool have_raw = false;
+
+                {
+                    std::lock_guard<std::mutex> lock(raw_mutex_);
+                    if (!raw_queue_.empty()) {
+                        raw = std::move(raw_queue_.front());
+                        raw_queue_.pop_front();
+                        have_raw = true;
+                    }
+                }
+
+                if (!have_raw) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    continue;
+                }
+
+                captured_frame captured;
+                captured.generation = raw.generation;
+                captured.sequence   = raw.sequence;
+                captured.bgra.resize(width_ * height_ * 4u);
+                uyvy_to_bgra(raw.uyvy.data(), captured.bgra.data(), width_, height_);
+                captured.audio = std::move(raw.audio);
+
+
+                {
+                    std::lock_guard<std::mutex> lock(frame_mutex_);
+
+                    // A signal-loss/reset can invalidate a raw frame while this
+                    // worker is converting it. Never allow such an in-flight
+                    // frame to cross the generation boundary and repopulate the
+                    // converted FIFO after both queues have been flushed.
+                    const auto current_generation = capture_generation_.load(std::memory_order_acquire);
+                    if (captured.generation != current_generation) {
+                        CASPAR_LOG(info) << print()
+                                         << L" capture generation: discarded stale converted frame seq="
+                                         << captured.sequence << L", frame-generation=" << captured.generation
+                                         << L", current-generation=" << current_generation;
+                        continue;
+                    }
+
+                    capture_queue_.emplace_back(std::move(captured));
+
+                    if (capture_queue_.size() > kCaptureQueueCapacity) {
+                        capture_queue_.pop_front();
+                        CASPAR_LOG(info) << print()
+                                         << L" capture queue: overflow; dropped oldest frame";
+                    }
+
+                    if (!capture_queue_primed_ &&
+                        capture_queue_.size() >= capture_queue_prime_target_) {
+                        capture_queue_primed_ = true;
+                        CASPAR_LOG(info) << print()
+                                         << (capture_queue_prime_target_ == kCaptureQueueStartupPrebuffer
+                                                 ? L" capture queue: primed "
+                                                 : L" capture queue: rebuffered ")
+                                         << capture_queue_.size() << L"/"
+                                         << kCaptureQueueCapacity;
+                    }
+                }
+            }
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(exception_mutex_);
+            if (!capture_exception_)
+                capture_exception_ = std::current_exception();
+            stop_requested_ = true;
+        }
+    }
+
     bool input_frame_is_stable()
     {
         const auto detected_format = device_.GetInputVideoFormat(input_source_);
@@ -612,7 +704,14 @@ class aja_producer final : public core::frame_producer
 
         if (!receiver_good) {
             if (signal_was_good_) {
-                CASPAR_LOG(info) << print() << L" SDI signal lost/unstable; holding last good frame";
+                const auto new_generation = capture_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+                CASPAR_LOG(info) << print() << L" SDI signal lost/unstable; holding last good frame"
+                                 << L"; capture generation=" << new_generation;
+
+                {
+                    std::lock_guard<std::mutex> raw_lock(raw_mutex_);
+                    raw_queue_.clear();
+                }
 
                 std::lock_guard<std::mutex> lock(frame_mutex_);
                 capture_queue_.clear();
@@ -683,6 +782,18 @@ class aja_producer final : public core::frame_producer
             captured = std::move(capture_queue_.front());
             capture_queue_.pop_front();
         }
+
+        if (captured.generation == last_latched_generation_) {
+            if (last_latched_sequence_ != 0 && captured.sequence <= last_latched_sequence_) {
+                CASPAR_LOG(warning) << print()
+                                    << L" capture sequence anomaly: previous=" << last_latched_sequence_
+                                    << L", current=" << captured.sequence
+                                    << L", generation=" << captured.generation;
+            }
+        } else {
+            last_latched_generation_ = captured.generation;
+        }
+        last_latched_sequence_ = captured.sequence;
 
         auto& bgra  = captured.bgra;
         auto& audio = captured.audio;
