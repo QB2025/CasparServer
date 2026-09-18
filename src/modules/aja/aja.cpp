@@ -4,7 +4,9 @@
 
 #include <ajantv2/includes/ntv2card.h>
 #include <ajantv2/includes/ntv2devicescanner.h>
+
 #include "consumer/aja_consumer.h"
+#include "producer/aja_producer.h"
 
 namespace caspar { namespace aja {
 
@@ -24,6 +26,10 @@ void init(const core::module_dependencies& dependencies)
     dependencies.consumer_registry->register_preconfigured_consumer_factory(
         L"aja",
         create_preconfigured_consumer);
+
+    dependencies.producer_registry->register_producer_factory(
+        L"AJA Producer",
+        create_producer);
 
     try {
         CNTV2DeviceScanner scanner(true);

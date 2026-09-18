@@ -10,6 +10,9 @@ set(SOURCES
 
     consumer/aja_consumer.cpp
     consumer/aja_consumer.h
+
+    producer/aja_producer.cpp
+    producer/aja_producer.h
 )
 
 casparcg_add_module_project(aja
@@ -58,3 +61,5 @@ target_link_libraries(aja PRIVATE
 
 set_target_properties(aja PROPERTIES FOLDER modules)
 source_group(sources ./*)
+source_group(sources\\consumer consumer/*)
+source_group(sources\\producer producer/*)
