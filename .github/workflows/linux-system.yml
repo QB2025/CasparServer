@@ -129,6 +129,26 @@ jobs:
                   DEBIAN_FRONTEND: noninteractive
                   APT_PREFIX: ${{ matrix.apt_prefix }}
 
+            - name: Prepare AJA SDK
+              if: ${{ matrix.family == 'ubuntu' || matrix.family == 'debian' }}
+              run: |
+                  mkdir -p "$GITHUB_WORKSPACE/.deps"
+
+                  git clone https://github.com/aja-video/libajantv2.git \
+                    "$GITHUB_WORKSPACE/.deps/libajantv2"
+
+                  git -C "$GITHUB_WORKSPACE/.deps/libajantv2" \
+                    checkout 4add45239a03960aa36de6fef326ee1b753e8ec9
+
+                  cmake \
+                    -DSOURCE_DIR="$GITHUB_WORKSPACE/.deps/libajantv2" \
+                    -DPATCH_FILE="$GITHUB_WORKSPACE/src/CMakeModules/patches/libajantv2-remove-transfer-success-log.patch" \
+                    -DGIT_EXECUTABLE="$(command -v git)" \
+                    -P "$GITHUB_WORKSPACE/src/CMakeModules/ApplyAjaPatch.cmake"
+
+                  echo "CASPARCG_AJANTV2_SOURCE_DIR=$GITHUB_WORKSPACE/.deps/libajantv2" \
+                    >> "$GITHUB_ENV"
+
             - name: Run build
               if: ${{ matrix.family == 'ubuntu' || matrix.family == 'debian' }}
               run: |
