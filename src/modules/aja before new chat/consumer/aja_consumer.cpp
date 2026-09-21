@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -219,6 +220,44 @@ class aja_consumer final : public core::frame_consumer
     bool   auto_circulate_started_     = false;
     ULWord successful_frame_transfers_ = 0;
 
+    // Diagnostic-only output/audio telemetry. No pacing, buffering or
+    // AutoCirculate behaviour is changed by these counters.
+    std::chrono::steady_clock::time_point diag_started_ = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last_send_;
+    std::uint64_t diag_send_calls_           = 0;
+    std::uint64_t diag_audio_values_         = 0;
+    std::uint64_t diag_audio_bytes_          = 0;
+    std::uint64_t diag_transfers_            = 0;
+    std::uint64_t diag_transfer_failures_    = 0;
+    std::uint64_t diag_blocked_sends_        = 0;
+    std::uint64_t diag_vertical_waits_       = 0;
+    double        diag_max_send_gap_ms_      = 0.0;
+    double        diag_total_wait_ms_        = 0.0;
+    double        diag_max_wait_ms_          = 0.0;
+    double        diag_total_transfer_ms_    = 0.0;
+    double        diag_max_transfer_ms_      = 0.0;
+    std::uint64_t diag_conversion_frames_    = 0;
+    double        diag_total_conversion_ms_  = 0.0;
+    double        diag_max_conversion_ms_    = 0.0;
+    ULWord        configured_audio_channels_ = 0;
+
+    // AutoCirculate CCTV diagnostics. Status queries only; no pacing/transfer behavior changes.
+    std::uint64_t diag_ac_status_samples_ = 0, diag_ac_status_failures_ = 0, diag_ac_wait_samples_ = 0, diag_ac_wait_cycles_ = 0, diag_ac_post_transfer_samples_ = 0, diag_ac_level_sum_ = 0;
+    ULWord diag_ac_level_min_ = 0, diag_ac_level_max_ = 0, diag_ac_available_min_ = 0, diag_ac_available_max_ = 0;
+    ULWord diag_ac_pre_wait_level_min_ = 0, diag_ac_pre_wait_level_max_ = 0, diag_ac_post_wait_level_min_ = 0, diag_ac_post_wait_level_max_ = 0;
+    ULWord diag_ac_pre_transfer_level_min_ = 0, diag_ac_pre_transfer_level_max_ = 0, diag_ac_post_transfer_level_min_ = 0, diag_ac_post_transfer_level_max_ = 0;
+    ULWord diag_ac_processed_first_ = 0, diag_ac_processed_last_ = 0, diag_ac_dropped_first_ = 0, diag_ac_dropped_last_ = 0;
+    bool diag_ac_have_counters_ = false;
+    std::uint64_t diag_ac_target_fill_submissions_ = 0;
+
+    // Field CCTV diagnostics. Read-only field-ID sampling around the existing
+    // vertical wait; this does not alter pacing or AutoCirculate behavior.
+    std::uint64_t diag_field_queries_ = 0, diag_field_query_failures_ = 0;
+    std::uint64_t diag_field_pre_f0_ = 0, diag_field_pre_f1_ = 0;
+    std::uint64_t diag_field_post_f0_ = 0, diag_field_post_f1_ = 0;
+    std::uint64_t diag_field_f0_to_f0_ = 0, diag_field_f0_to_f1_ = 0;
+    std::uint64_t diag_field_f1_to_f0_ = 0, diag_field_f1_to_f1_ = 0;
+
     LWord fill_start_frame_ = -1;
     LWord fill_end_frame_   = -1;
     LWord next_fill_frame_  = -1;
@@ -259,6 +298,11 @@ class aja_consumer final : public core::frame_consumer
     std::atomic_bool pipeline_stop_requested_{false};
 
     std::atomic_bool           output_worker_failed_{false};
+    std::atomic<std::uint64_t> input_queue_blocked_sends_{0};
+    std::atomic<std::size_t>   input_queue_max_depth_{0};
+    std::atomic<std::size_t>   prepared_queue_max_depth_{0};
+
+    std::mutex conversion_diag_mutex_;
 
   public:
     aja_consumer(ULWord device_index, NTV2Channel channel, NTV2Channel key_channel = NTV2_CHANNEL_INVALID)
@@ -543,6 +587,8 @@ class aja_consumer final : public core::frame_consumer
             num_audio_channels = 8;
         }
 
+        configured_audio_channels_ = num_audio_channels;
+
         device_.SetNumberAudioChannels(num_audio_channels, audio_system_);
 
         device_.SetAudioRate(NTV2_AUDIO_48K, audio_system_);
@@ -660,7 +706,18 @@ class aja_consumer final : public core::frame_consumer
             if (prepared.video.size() != raster_bytes)
                 prepared.video.resize(raster_bytes);
 
+            const auto conversion_started = std::chrono::steady_clock::now();
             bgra_to_uyvy(image.data(), prepared.video.data(), format_desc_.width, format_desc_.height);
+            const double conversion_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - conversion_started).count();
+
+            {
+                std::lock_guard<std::mutex> lock(conversion_diag_mutex_);
+                ++diag_conversion_frames_;
+                diag_total_conversion_ms_ += conversion_ms;
+                diag_max_conversion_ms_ = std::max(diag_max_conversion_ms_, conversion_ms);
+            }
 
             if (key_enabled_) {
                 if (prepared.key.size() != prepared.video.size())
@@ -680,25 +737,101 @@ class aja_consumer final : public core::frame_consumer
     bool transfer_prepared_frame(prepared_output_frame& prepared)
     {
         try {
-            AUTOCIRCULATE_STATUS status;
-            if (!device_.AutoCirculateGetStatus(channel_, status))
-                return false;
+            const auto send_now = std::chrono::steady_clock::now();
 
+            if (last_send_.time_since_epoch().count() != 0) {
+                const double gap_ms =
+                    std::chrono::duration<double, std::milli>(send_now - last_send_).count();
+                diag_max_send_gap_ms_ = std::max(diag_max_send_gap_ms_, gap_ms);
+            }
+
+            last_send_ = send_now;
+            ++diag_send_calls_;
+            diag_audio_values_ += prepared.audio.size();
+
+            AUTOCIRCULATE_STATUS status;
+            if (!device_.AutoCirculateGetStatus(channel_, status)) { ++diag_ac_status_failures_; return false; }
+
+            auto sample_ac_status = [this](const AUTOCIRCULATE_STATUS& sampled) {
+                const ULWord level = sampled.GetBufferLevel(), available = sampled.GetNumAvailableOutputFrames();
+                if (!diag_ac_status_samples_) { diag_ac_level_min_ = diag_ac_level_max_ = level; diag_ac_available_min_ = diag_ac_available_max_ = available; }
+                else { diag_ac_level_min_ = std::min(diag_ac_level_min_, level); diag_ac_level_max_ = std::max(diag_ac_level_max_, level); diag_ac_available_min_ = std::min(diag_ac_available_min_, available); diag_ac_available_max_ = std::max(diag_ac_available_max_, available); }
+                diag_ac_level_sum_ += level; ++diag_ac_status_samples_;
+                if (!diag_ac_have_counters_) { diag_ac_processed_first_ = sampled.GetProcessedFrameCount(); diag_ac_dropped_first_ = sampled.GetDroppedFrameCount(); diag_ac_have_counters_ = true; }
+                diag_ac_processed_last_ = sampled.GetProcessedFrameCount(); diag_ac_dropped_last_ = sampled.GetDroppedFrameCount();
+            };
+            sample_ac_status(status);
+
+            const auto wait_started = std::chrono::steady_clock::now();
+            bool blocked_this_send = false;
+
+            // V2.3 target-fill policy:
+            // Keep AJA's normal >1-free-slot admission while the ring is healthy.
+            // If the ring has drained below the normal operating region, submit
+            // the already-prepared frame as soon as at least one real AC slot is
+            // free. Never overwrite a full ring; never synthesize a frame.
             constexpr ULWord kAcTargetFill = 5;
             auto ac_may_accept_for_target_fill = [&](const AUTOCIRCULATE_STATUS& s) {
-                const ULWord level     = s.GetBufferLevel();
+                const ULWord level = s.GetBufferLevel();
                 const ULWord available = s.GetNumAvailableOutputFrames();
-
                 if (level < kAcTargetFill)
                     return available >= 1;
-
                 return s.CanAcceptMoreOutputFrames();
             };
 
             while (!ac_may_accept_for_target_fill(status)) {
+                const ULWord pre = status.GetBufferLevel();
+                if (!diag_ac_wait_samples_) diag_ac_pre_wait_level_min_ = diag_ac_pre_wait_level_max_ = pre;
+                else { diag_ac_pre_wait_level_min_ = std::min(diag_ac_pre_wait_level_min_, pre); diag_ac_pre_wait_level_max_ = std::max(diag_ac_pre_wait_level_max_, pre); }
+                NTV2FieldID pre_field = NTV2_FIELD0;
+                const bool have_pre_field = device_.GetOutputFieldID(channel_, pre_field);
+                ++diag_field_queries_;
+                if (!have_pre_field) ++diag_field_query_failures_;
+                else if (pre_field == NTV2_FIELD0) ++diag_field_pre_f0_;
+                else if (pre_field == NTV2_FIELD1) ++diag_field_pre_f1_;
+
+                blocked_this_send = true; ++diag_vertical_waits_; ++diag_ac_wait_cycles_;
                 device_.WaitForOutputVerticalInterrupt(channel_);
-                if (!device_.AutoCirculateGetStatus(channel_, status))
-                    return false;
+
+                NTV2FieldID post_field = NTV2_FIELD0;
+                const bool have_post_field = device_.GetOutputFieldID(channel_, post_field);
+                ++diag_field_queries_;
+                if (!have_post_field) ++diag_field_query_failures_;
+                else {
+                    if (post_field == NTV2_FIELD0) ++diag_field_post_f0_;
+                    else if (post_field == NTV2_FIELD1) ++diag_field_post_f1_;
+
+                    if (have_pre_field) {
+                        if (pre_field == NTV2_FIELD0 && post_field == NTV2_FIELD0) ++diag_field_f0_to_f0_;
+                        else if (pre_field == NTV2_FIELD0 && post_field == NTV2_FIELD1) ++diag_field_f0_to_f1_;
+                        else if (pre_field == NTV2_FIELD1 && post_field == NTV2_FIELD0) ++diag_field_f1_to_f0_;
+                        else if (pre_field == NTV2_FIELD1 && post_field == NTV2_FIELD1) ++diag_field_f1_to_f1_;
+                    }
+                }
+
+                if (!device_.AutoCirculateGetStatus(channel_, status)) { ++diag_ac_status_failures_; return false; }
+                const ULWord post = status.GetBufferLevel();
+                if (!diag_ac_wait_samples_) diag_ac_post_wait_level_min_ = diag_ac_post_wait_level_max_ = post;
+                else { diag_ac_post_wait_level_min_ = std::min(diag_ac_post_wait_level_min_, post); diag_ac_post_wait_level_max_ = std::max(diag_ac_post_wait_level_max_, post); }
+                ++diag_ac_wait_samples_; sample_ac_status(status);
+            }
+
+            const ULWord pre_transfer_level = status.GetBufferLevel();
+            if (auto_circulate_started_ &&
+                pre_transfer_level < kAcTargetFill &&
+                status.GetNumAvailableOutputFrames() >= 1)
+                ++diag_ac_target_fill_submissions_;
+
+            if (!diag_transfers_) diag_ac_pre_transfer_level_min_ = diag_ac_pre_transfer_level_max_ = pre_transfer_level;
+            else { diag_ac_pre_transfer_level_min_ = std::min(diag_ac_pre_transfer_level_min_, pre_transfer_level); diag_ac_pre_transfer_level_max_ = std::max(diag_ac_pre_transfer_level_max_, pre_transfer_level); }
+
+            if (blocked_this_send) {
+                ++diag_blocked_sends_;
+                const double wait_ms =
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - wait_started).count();
+                diag_total_wait_ms_ += wait_ms;
+                diag_max_wait_ms_ = std::max(diag_max_wait_ms_, wait_ms);
             }
 
             AUTOCIRCULATE_TRANSFER transfer;
@@ -706,12 +839,13 @@ class aja_consumer final : public core::frame_consumer
                                     static_cast<ULWord>(prepared.video.size()));
 
             if (!prepared.audio.empty()) {
+                diag_audio_bytes_ += prepared.audio.size() * sizeof(std::int32_t);
                 transfer.SetAudioBuffer(reinterpret_cast<ULWord*>(prepared.audio.data()),
                                         static_cast<ULWord>(prepared.audio.size() * sizeof(std::int32_t)));
             }
 
             if (key_enabled_) {
-                const LWord stride           = fill_end_frame_ - fill_start_frame_ + 1;
+                const LWord stride = fill_end_frame_ - fill_start_frame_ + 1;
                 const LWord key_device_frame = next_fill_frame_ + stride;
 
                 if (!device_.DMAWriteFrame(static_cast<ULWord>(key_device_frame),
@@ -720,13 +854,34 @@ class aja_consumer final : public core::frame_consumer
                     CASPAR_LOG(error) << L"AJA key DMAWriteFrame failed for device frame " << key_device_frame;
                     return false;
                 }
+
                 transfer.acDesiredFrame = next_fill_frame_;
             }
 
-            if (!device_.AutoCirculateTransfer(channel_, transfer)) {
+            const auto transfer_started = std::chrono::steady_clock::now();
+            const bool transfer_ok = device_.AutoCirculateTransfer(channel_, transfer);
+            const double transfer_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - transfer_started).count();
+
+            diag_total_transfer_ms_ += transfer_ms;
+            diag_max_transfer_ms_ = std::max(diag_max_transfer_ms_, transfer_ms);
+
+            if (!transfer_ok) {
+                ++diag_transfer_failures_;
                 CASPAR_LOG(error) << L"AJA AutoCirculateTransfer failed";
                 return false;
             }
+
+            ++diag_transfers_;
+
+            AUTOCIRCULATE_STATUS post_transfer_status;
+            if (device_.AutoCirculateGetStatus(channel_, post_transfer_status)) {
+                const ULWord post = post_transfer_status.GetBufferLevel();
+                if (!diag_ac_post_transfer_samples_) diag_ac_post_transfer_level_min_ = diag_ac_post_transfer_level_max_ = post;
+                else { diag_ac_post_transfer_level_min_ = std::min(diag_ac_post_transfer_level_min_, post); diag_ac_post_transfer_level_max_ = std::max(diag_ac_post_transfer_level_max_, post); }
+                ++diag_ac_post_transfer_samples_; sample_ac_status(post_transfer_status);
+            } else ++diag_ac_status_failures_;
 
             if (key_enabled_) {
                 if (next_fill_frame_ >= fill_end_frame_)
@@ -742,10 +897,93 @@ class aja_consumer final : public core::frame_consumer
                     CASPAR_LOG(error) << L"Unable to start AJA AutoCirculate frame output";
                     return false;
                 }
+
                 auto_circulate_started_ = true;
                 CASPAR_LOG(info) << L"AJA AutoCirculate frame output started after " << successful_frame_transfers_
                                  << L" buffered frames";
             }
+
+            const auto diag_now = std::chrono::steady_clock::now();
+            if (diag_now - diag_started_ >= std::chrono::seconds(1)) {
+                const double avg_wait_ms =
+                    diag_blocked_sends_ ? diag_total_wait_ms_ / static_cast<double>(diag_blocked_sends_) : 0.0;
+                const double avg_transfer_ms =
+                    diag_transfers_ ? diag_total_transfer_ms_ / static_cast<double>(diag_transfers_) : 0.0;
+
+                std::uint64_t conversion_frames = 0;
+                double total_conversion_ms = 0.0;
+                double max_conversion_ms = 0.0;
+                {
+                    std::lock_guard<std::mutex> lock(conversion_diag_mutex_);
+                    conversion_frames = diag_conversion_frames_;
+                    total_conversion_ms = diag_total_conversion_ms_;
+                    max_conversion_ms = diag_max_conversion_ms_;
+                    diag_conversion_frames_ = 0;
+                    diag_total_conversion_ms_ = 0.0;
+                    diag_max_conversion_ms_ = 0.0;
+                }
+
+                CASPAR_LOG(info)
+                    << print()
+                    << L" output clock: sends=" << diag_send_calls_
+                    << L", audio-values=" << diag_audio_values_
+                    << L", audio-bytes=" << diag_audio_bytes_
+                    << L", hw-audio-ch=" << configured_audio_channels_
+                    << L", transfers=" << diag_transfers_
+                    << L", failures=" << diag_transfer_failures_
+                    << L", blocked=" << diag_blocked_sends_
+                    << L", vwaits=" << diag_vertical_waits_
+                    << L", send-gap-max=" << diag_max_send_gap_ms_ << L" ms"
+                    << L", wait avg/max=" << avg_wait_ms << L"/" << diag_max_wait_ms_ << L" ms"
+                    << L", transfer avg/max=" << avg_transfer_ms << L"/" << diag_max_transfer_ms_ << L" ms"
+                    << L", convert frames=" << conversion_frames
+                    << L", convert avg/max="
+                    << (conversion_frames ? total_conversion_ms / static_cast<double>(conversion_frames) : 0.0)
+                    << L"/" << max_conversion_ms << L" ms"
+                    << L", input-blocked=" << input_queue_blocked_sends_.exchange(0)
+                    << L", input-max=" << input_queue_max_depth_.exchange(0) << L"/" << kInputQueueCapacity
+                    << L", prepared-max=" << prepared_queue_max_depth_.exchange(0) << L"/" << kPreparedQueueCapacity
+                    << L", ac-status=" << diag_ac_status_samples_ << L", ac-status-fail=" << diag_ac_status_failures_
+                    << L", ac-level avg/min/max=" << (diag_ac_status_samples_ ? static_cast<double>(diag_ac_level_sum_) / diag_ac_status_samples_ : 0.0) << L"/" << diag_ac_level_min_ << L"/" << diag_ac_level_max_
+                    << L", ac-avail min/max=" << diag_ac_available_min_ << L"/" << diag_ac_available_max_
+                    << L", ac-wait-cycles=" << diag_ac_wait_cycles_ << L", ac-prewait min/max=" << diag_ac_pre_wait_level_min_ << L"/" << diag_ac_pre_wait_level_max_
+                    << L", ac-postwait min/max=" << diag_ac_post_wait_level_min_ << L"/" << diag_ac_post_wait_level_max_
+                    << L", ac-prexfer min/max=" << diag_ac_pre_transfer_level_min_ << L"/" << diag_ac_pre_transfer_level_max_
+                    << L", ac-postxfer min/max=" << diag_ac_post_transfer_level_min_ << L"/" << diag_ac_post_transfer_level_max_
+                    << L", ac-processed-delta=" << (diag_ac_have_counters_ ? diag_ac_processed_last_ - diag_ac_processed_first_ : 0)
+                    << L", ac-dropped-delta=" << (diag_ac_have_counters_ ? diag_ac_dropped_last_ - diag_ac_dropped_first_ : 0)
+                    << L", ac-target-fill=" << diag_ac_target_fill_submissions_
+                    << L", field-q=" << diag_field_queries_ << L", field-q-fail=" << diag_field_query_failures_
+                    << L", field-pre f0/f1=" << diag_field_pre_f0_ << L"/" << diag_field_pre_f1_
+                    << L", field-post f0/f1=" << diag_field_post_f0_ << L"/" << diag_field_post_f1_
+                    << L", field-x f0>f0/f0>f1/f1>f0/f1>f1="
+                    << diag_field_f0_to_f0_ << L"/" << diag_field_f0_to_f1_ << L"/"
+                    << diag_field_f1_to_f0_ << L"/" << diag_field_f1_to_f1_;
+
+                diag_started_           = diag_now;
+                diag_send_calls_        = 0;
+                diag_audio_values_      = 0;
+                diag_audio_bytes_       = 0;
+                diag_transfers_         = 0;
+                diag_transfer_failures_ = 0;
+                diag_blocked_sends_     = 0;
+                diag_vertical_waits_    = 0;
+                diag_max_send_gap_ms_   = 0.0;
+                diag_total_wait_ms_     = 0.0;
+                diag_max_wait_ms_       = 0.0;
+                diag_total_transfer_ms_ = 0.0;
+                diag_max_transfer_ms_   = 0.0;
+                diag_ac_status_samples_ = diag_ac_status_failures_ = diag_ac_wait_samples_ = diag_ac_wait_cycles_ = diag_ac_post_transfer_samples_ = diag_ac_level_sum_ = 0;
+                diag_ac_level_min_ = diag_ac_level_max_ = diag_ac_available_min_ = diag_ac_available_max_ = 0;
+                diag_ac_pre_wait_level_min_ = diag_ac_pre_wait_level_max_ = diag_ac_post_wait_level_min_ = diag_ac_post_wait_level_max_ = 0;
+                diag_ac_pre_transfer_level_min_ = diag_ac_pre_transfer_level_max_ = diag_ac_post_transfer_level_min_ = diag_ac_post_transfer_level_max_ = 0;
+                diag_ac_processed_first_ = diag_ac_processed_last_ = diag_ac_dropped_first_ = diag_ac_dropped_last_ = 0; diag_ac_have_counters_ = false;
+                diag_ac_target_fill_submissions_ = 0;
+                diag_field_queries_ = diag_field_query_failures_ = 0;
+                diag_field_pre_f0_ = diag_field_pre_f1_ = diag_field_post_f0_ = diag_field_post_f1_ = 0;
+                diag_field_f0_to_f0_ = diag_field_f0_to_f1_ = diag_field_f1_to_f0_ = diag_field_f1_to_f1_ = 0;
+            }
+
             return true;
         } catch (...) {
             CASPAR_LOG_CURRENT_EXCEPTION();
@@ -760,6 +998,9 @@ class aja_consumer final : public core::frame_consumer
 
         std::unique_lock<std::mutex> lock(input_queue_mutex_);
 
+        if (input_queue_.size() >= kInputQueueCapacity)
+            input_queue_blocked_sends_.fetch_add(1);
+
         input_queue_not_full_.wait(lock, [this] {
             return pipeline_stop_requested_ || output_worker_failed_.load() ||
                    input_queue_.size() < kInputQueueCapacity;
@@ -769,6 +1010,12 @@ class aja_consumer final : public core::frame_consumer
             return caspar::make_ready_future(false);
 
         input_queue_.push_back(queued_output_frame{field, std::move(frame)});
+
+        const std::size_t queue_depth = input_queue_.size();
+        std::size_t observed_max = input_queue_max_depth_.load();
+        while (queue_depth > observed_max &&
+               !input_queue_max_depth_.compare_exchange_weak(observed_max, queue_depth)) {
+        }
 
         lock.unlock();
         input_queue_not_empty_.notify_one();
@@ -914,6 +1161,12 @@ class aja_consumer final : public core::frame_consumer
 
             prepared_queue_.push_back(std::move(prepared));
 
+            const std::size_t queue_depth = prepared_queue_.size();
+            std::size_t observed_max = prepared_queue_max_depth_.load();
+            while (queue_depth > observed_max &&
+                   !prepared_queue_max_depth_.compare_exchange_weak(observed_max, queue_depth)) {
+            }
+
             lock.unlock();
             prepared_queue_not_empty_.notify_one();
         }
@@ -923,6 +1176,7 @@ class aja_consumer final : public core::frame_consumer
     {
         for (;;) {
             std::unique_ptr<prepared_output_frame> prepared;
+
             {
                 std::unique_lock<std::mutex> lock(prepared_queue_mutex_);
                 prepared_queue_not_empty_.wait(lock, [this] {

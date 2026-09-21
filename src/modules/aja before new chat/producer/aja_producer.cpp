@@ -189,7 +189,7 @@ class aja_producer final : public core::frame_producer
     // clocks are independent, so maintain an operating region rather than only
     // priming once and then allowing the reservoir to wander toward zero.
     static constexpr std::size_t kProgressiveAudioTargetFrames   = 3200;
-    static constexpr std::size_t kProgressiveAudioDeadbandFrames = 200;
+    static constexpr std::size_t kProgressiveAudioDeadbandFrames = 800;
     static constexpr std::size_t kProgressiveAudioLowFrames =
         kProgressiveAudioTargetFrames - kProgressiveAudioDeadbandFrames;
     static constexpr std::size_t kProgressiveAudioHighFrames =
@@ -205,7 +205,7 @@ class aja_producer final : public core::frame_producer
     static constexpr int    kProgressiveAudioRate = 48000;
     static constexpr int    kProgressiveAudioCompensationDistance = 48000; // 1 second
     static constexpr int    kProgressiveAudioMaxCorrectionPpm = 1000;
-    static constexpr double kProgressiveAudioFilterAlpha = 0.03; // ~0.55 s at 60 callbacks/s
+    static constexpr double kProgressiveAudioFilterAlpha = 0.01; // ~1.7 s at 60 callbacks/s
     static constexpr std::size_t kProgressiveAudioSWRPrimeFrames = 64;
     bool   progressive_audio_filter_initialized_ = false;
     double progressive_audio_filtered_depth_ = static_cast<double>(kProgressiveAudioTargetFrames);
@@ -1025,58 +1025,18 @@ class aja_producer final : public core::frame_producer
                 CASPAR_THROW_EXCEPTION(caspar_exception()
                                        << msg_info("AJA progressive audio resampler conversion failed"));
 
-            std::size_t consumed_input_frames = static_cast<std::size_t>(input_frames);
-
-            // SWR's filter/phase state can occasionally leave the first conversion
-            // one sample short even though the external reservoir still has plenty
-            // of audio.  Top up the SAME output block from the external reservoir
-            // instead of exposing a zero-filled tail to Caspar.  This preserves the
-            // fractional input budget as the normal clock-domain servo; the extra
-            // input is consumed only when SWR proves that it needs it to complete
-            // the requested fixed-size output block.
-            if (produced_frames < requested_samples &&
-                consumed_input_frames < available_frames) {
-                const int remaining_output = requested_samples - produced_frames;
-                const std::size_t remaining_external = available_frames - consumed_input_frames;
-                const std::size_t topup_input_frames = std::min<std::size_t>(
-                    remaining_external,
-                    static_cast<std::size_t>(remaining_output));
-
-                const uint8_t* topup_input_ptr = reinterpret_cast<const uint8_t*>(
-                    progressive_audio_.data() + progressive_audio_offset_ +
-                    consumed_input_frames * kAudioChannels);
-                const uint8_t* topup_input_planes[1] = {topup_input_ptr};
-                uint8_t* topup_output_ptr = reinterpret_cast<uint8_t*>(
-                    audio_frame.data() + static_cast<std::size_t>(produced_frames) * kAudioChannels);
-                uint8_t* topup_output_planes[1] = {topup_output_ptr};
-
-                const int topup_produced = swr_convert(progressive_audio_swr_,
-                                                       topup_output_planes,
-                                                       remaining_output,
-                                                       topup_input_planes,
-                                                       static_cast<int>(topup_input_frames));
-                if (topup_produced < 0)
-                    CASPAR_THROW_EXCEPTION(caspar_exception()
-                                           << msg_info("AJA progressive audio resampler top-up conversion failed"));
-
-                consumed_input_frames += topup_input_frames;
-                produced_frames += topup_produced;
-            }
-
-            progressive_audio_offset_ += consumed_input_frames * kAudioChannels;
-            if (!progressive_audio_swr_primed_ && consumed_input_frames > 0)
+            progressive_audio_offset_ +=
+                static_cast<std::size_t>(input_frames) * kAudioChannels;
+            if (!progressive_audio_swr_primed_ && input_frames > 0)
                 progressive_audio_swr_primed_ = true;
 
             if (produced_frames < requested_samples) {
                 ++progressive_audio_diag_underflows_;
-                CASPAR_LOG(warning) << print()
-                                    << L" progressive audio underflow after SWR top-up: requested="
-                                    << requested_samples << L", produced=" << produced_frames
-                                    << L", external-before=" << available_frames
-                                    << L", consumed-input=" << consumed_input_frames
-                                    << L", correction-ppm=" << progressive_audio_correction_ppm_
-                                    << L", swr-delay="
-                                    << swr_get_delay(progressive_audio_swr_, kProgressiveAudioRate);
+                CASPAR_LOG(debug) << print()
+                                  << L" progressive audio reservoir underflow: requested="
+                                  << requested_frames << L" frames, produced=" << produced_frames
+                                  << L", external-before=" << available_frames
+                                  << L", filtered=" << progressive_audio_filtered_depth_;
             }
         }
 
