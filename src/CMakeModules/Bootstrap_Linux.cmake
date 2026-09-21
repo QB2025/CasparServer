@@ -49,16 +49,6 @@ set(AJANTV2_DISABLE_TESTS ON CACHE BOOL "" FORCE)
 set(AJANTV2_DISABLE_TOOLS ON CACHE BOOL "" FORCE)
 set(AJANTV2_DISABLE_PLUGIN_LOAD ON CACHE BOOL "" FORCE)
 
-if(DEFINED ENV{CASPARCG_AJANTV2_SOURCE_DIR})
-    set(
-        FETCHCONTENT_SOURCE_DIR_LIBAJANTV2
-        "$ENV{CASPARCG_AJANTV2_SOURCE_DIR}"
-        CACHE PATH
-        "Pre-populated libajantv2 source directory"
-        FORCE
-    )
-endif()
-
 FetchContent_Declare(
     libajantv2
     GIT_REPOSITORY https://github.com/aja-video/libajantv2.git

@@ -99,7 +99,7 @@ jobs:
 
                   # install some needed tooling
                   $APT_PREFIX apt-get update
-                  $APT_PREFIX apt-get -y install build-essential dpkg-dev debhelper devscripts
+                  $APT_PREFIX apt-get -y install build-essential dpkg-dev debhelper devscripts git
 
                   if [[ "${{ matrix.family }}" == "ubuntu" ]]; then
                     $APT_PREFIX apt-get -y install software-properties-common
@@ -145,9 +145,6 @@ jobs:
                     -DPATCH_FILE="$GITHUB_WORKSPACE/src/CMakeModules/patches/libajantv2-remove-transfer-success-log.patch" \
                     -DGIT_EXECUTABLE="$(command -v git)" \
                     -P "$GITHUB_WORKSPACE/src/CMakeModules/ApplyAjaPatch.cmake"
-
-                  echo "CASPARCG_AJANTV2_SOURCE_DIR=$GITHUB_WORKSPACE/.deps/libajantv2" \
-                    >> "$GITHUB_ENV"
 
             - name: Run build
               if: ${{ matrix.family == 'ubuntu' || matrix.family == 'debian' }}
