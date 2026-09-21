@@ -19,3 +19,5 @@ src/.idea
 # debian build artifacts
 /debian
 /obj-*
+# Local AJA development backups
+/src/modules/aja before new chat/

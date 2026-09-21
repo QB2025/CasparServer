@@ -29,7 +29,6 @@ extern "C" {
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <limits>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -161,12 +160,6 @@ class aja_producer final : public core::frame_producer
     bool                      signal_was_good_           = true;
     unsigned                  clean_reacquire_frames_    = kCleanFramesAfterReacquire;
 
-    // Passive SDI receiver diagnostics. These counters are observational only:
-    // they never reject a frame or alter capture/recovery behavior.
-    ULWord sdi_diag_unlock_count_ = 0;
-    ULWord sdi_diag_crc_a_        = 0;
-    ULWord sdi_diag_crc_b_        = 0;
-    bool   sdi_diag_initialized_  = false;
 
     core::draw_frame latched_frame_a_;
     core::draw_frame latched_frame_b_;
@@ -214,14 +207,6 @@ class aja_producer final : public core::frame_producer
     int    progressive_audio_correction_ppm_ = 0;
     int    progressive_audio_compensation_delta_ = 0;
 
-    // Diagnostic-only telemetry for the progressive audio clock boundary.
-    // Counts are sample-frames (all 16 channels together), not interleaved values.
-    std::chrono::steady_clock::time_point progressive_audio_diag_started_ = std::chrono::steady_clock::now();
-    std::uint64_t progressive_audio_diag_captured_   = 0;
-    std::uint64_t progressive_audio_diag_requested_  = 0;
-    std::uint64_t progressive_audio_diag_underflows_ = 0;
-    std::size_t   progressive_audio_diag_min_depth_  = std::numeric_limits<std::size_t>::max();
-    std::size_t   progressive_audio_diag_max_depth_  = 0;
     std::uint64_t             progressive_generation_   = 0;
     std::uint64_t             progressive_sequence_     = 0;
     std::atomic_bool          progressive_reset_requested_{false};
@@ -508,15 +493,6 @@ class aja_producer final : public core::frame_producer
         capture_buffer_.resize(static_cast<std::size_t>(format_desc.GetVideoWriteSize()));
         capture_audio_buffer_.resize(256 * 1024);
 
-        sdi_diag_unlock_count_ = device_.GetSDIUnlockCount(channel_);
-        sdi_diag_crc_a_        = device_.GetCRCErrorCountA(channel_);
-        sdi_diag_crc_b_        = device_.GetCRCErrorCountB(channel_);
-        sdi_diag_initialized_  = true;
-
-        CASPAR_LOG(info) << print()
-                         << L" SDI diagnostics baseline: unlocks=" << sdi_diag_unlock_count_
-                         << L", CRC-A=" << sdi_diag_crc_a_
-                         << L", CRC-B=" << sdi_diag_crc_b_;
 
         state_["device"]            = static_cast<int64_t>(device_index_ + 1);
         state_["channel"]           = static_cast<int64_t>(static_cast<int>(channel_) + 1);
@@ -527,36 +503,6 @@ class aja_producer final : public core::frame_producer
         CASPAR_LOG(info) << L"AJA producer initialized: device " << (device_index_ + 1) << L", input channel "
                          << (static_cast<int>(channel_) + 1) << L", detected " << input_format_desc_.name
                          << L", 16-channel 48 kHz embedded audio";
-    }
-
-    void monitor_sdi_diagnostics()
-    {
-        const ULWord unlock_count = device_.GetSDIUnlockCount(channel_);
-        const ULWord crc_a        = device_.GetCRCErrorCountA(channel_);
-        const ULWord crc_b        = device_.GetCRCErrorCountB(channel_);
-
-        if (!sdi_diag_initialized_) {
-            sdi_diag_unlock_count_ = unlock_count;
-            sdi_diag_crc_a_        = crc_a;
-            sdi_diag_crc_b_        = crc_b;
-            sdi_diag_initialized_  = true;
-            return;
-        }
-
-        if (unlock_count == sdi_diag_unlock_count_ &&
-            crc_a == sdi_diag_crc_a_ &&
-            crc_b == sdi_diag_crc_b_)
-            return;
-
-        CASPAR_LOG(warning) << print()
-                            << L" SDI diagnostics changed: unlocks="
-                            << sdi_diag_unlock_count_ << L"->" << unlock_count
-                            << L", CRC-A=" << sdi_diag_crc_a_ << L"->" << crc_a
-                            << L", CRC-B=" << sdi_diag_crc_b_ << L"->" << crc_b;
-
-        sdi_diag_unlock_count_ = unlock_count;
-        sdi_diag_crc_a_        = crc_a;
-        sdi_diag_crc_b_        = crc_b;
     }
 
     void monitor_signal_without_frame()
@@ -571,7 +517,6 @@ class aja_producer final : public core::frame_producer
         // disappears. Probe receiver state independently so signal-loss
         // detection does not depend on a successful transfer.
         (void)input_frame_is_stable();
-        monitor_sdi_diagnostics();
     }
 
     void capture_loop()
@@ -606,8 +551,6 @@ class aja_producer final : public core::frame_producer
 
                     if (!input_frame_is_stable())
                         continue;
-
-                    monitor_sdi_diagnostics();
 
                     const ULWord audio_bytes            = transfer.GetCapturedAudioByteCount();
                     const ULWord bytes_per_sample_frame = kAudioChannels * sizeof(std::int32_t);
@@ -709,11 +652,8 @@ class aja_producer final : public core::frame_producer
 
                     capture_queue_.emplace_back(std::move(captured));
 
-                    if (capture_queue_.size() > kCaptureQueueCapacity) {
+                    if (capture_queue_.size() > kCaptureQueueCapacity)
                         capture_queue_.pop_front();
-                        CASPAR_LOG(info) << print()
-                                         << L" capture queue: overflow; dropped oldest frame";
-                    }
 
                     if (!capture_queue_primed_ &&
                         capture_queue_.size() >= capture_queue_prime_target_) {
@@ -913,7 +853,6 @@ class aja_producer final : public core::frame_producer
             progressive_audio_.insert(progressive_audio_.end(),
                                       captured.audio.begin(),
                                       captured.audio.end());
-            progressive_audio_diag_captured_ += captured.audio.size() / kAudioChannels;
         }
 
         if (progressive_video_uyvy_.empty())
@@ -927,7 +866,6 @@ class aja_producer final : public core::frame_producer
                 ? progressive_audio_.size() - progressive_audio_offset_
                 : 0u;
 
-        progressive_audio_diag_requested_ += requested_frames;
 
         std::vector<std::int32_t> audio_frame(requested_values, 0);
 
@@ -1068,7 +1006,6 @@ class aja_producer final : public core::frame_producer
                 progressive_audio_swr_primed_ = true;
 
             if (produced_frames < requested_samples) {
-                ++progressive_audio_diag_underflows_;
                 CASPAR_LOG(warning) << print()
                                     << L" progressive audio underflow after SWR top-up: requested="
                                     << requested_samples << L", produced=" << produced_frames
@@ -1088,49 +1025,6 @@ class aja_producer final : public core::frame_producer
             progressive_audio_offset_ = 0;
         }
 
-        const std::size_t reservoir_frames =
-            (progressive_audio_.size() > progressive_audio_offset_)
-                ? (progressive_audio_.size() - progressive_audio_offset_) / kAudioChannels
-                : 0u;
-
-        progressive_audio_diag_min_depth_ =
-            std::min(progressive_audio_diag_min_depth_, reservoir_frames);
-        progressive_audio_diag_max_depth_ =
-            std::max(progressive_audio_diag_max_depth_, reservoir_frames);
-
-        const auto audio_diag_now = std::chrono::steady_clock::now();
-        if (audio_diag_now - progressive_audio_diag_started_ >= std::chrono::seconds(1)) {
-            const std::size_t min_depth =
-                progressive_audio_diag_min_depth_ == std::numeric_limits<std::size_t>::max()
-                    ? reservoir_frames
-                    : progressive_audio_diag_min_depth_;
-
-            CASPAR_LOG(info) << print()
-                             << L" audio clock: captured=" << progressive_audio_diag_captured_
-                             << L", requested=" << progressive_audio_diag_requested_
-                             << L", reservoir=" << reservoir_frames
-                             << L", min=" << min_depth
-                             << L", max=" << progressive_audio_diag_max_depth_
-                             << L", target=" << kProgressiveAudioTargetFrames
-                             << L", band=" << kProgressiveAudioLowFrames << L"-"
-                             << kProgressiveAudioHighFrames
-                             << L", started=" << (progressive_audio_started_ ? L"yes" : L"no")
-                             << L", filtered=" << progressive_audio_filtered_depth_
-                             << L", correction-ppm=" << progressive_audio_correction_ppm_
-                             << L", compensation-delta=" << progressive_audio_compensation_delta_
-                             << L", swr-delay="
-                             << (progressive_audio_swr_
-                                     ? swr_get_delay(progressive_audio_swr_, kProgressiveAudioRate)
-                                     : 0)
-                             << L", underflows=" << progressive_audio_diag_underflows_;
-
-            progressive_audio_diag_started_    = audio_diag_now;
-            progressive_audio_diag_captured_   = 0;
-            progressive_audio_diag_requested_  = 0;
-            progressive_audio_diag_underflows_ = 0;
-            progressive_audio_diag_min_depth_  = reservoir_frames;
-            progressive_audio_diag_max_depth_  = reservoir_frames;
-        }
 
         // Build a fresh Caspar frame every callback so repeated video can carry
         // the next audio slice. This is intentional clock-domain adaptation,

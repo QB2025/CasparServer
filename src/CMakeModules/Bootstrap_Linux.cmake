@@ -42,6 +42,28 @@ if(NOT SFML_FOUND)
     find_package(SFML 2 COMPONENTS graphics system window REQUIRED)
 endif()
 
+set(AJANTV2_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_DEMOS ON CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_DRIVER ON CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_TESTS ON CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_TOOLS ON CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    libajantv2
+    GIT_REPOSITORY https://github.com/aja-video/libajantv2.git
+    GIT_TAG 4add45239a03960aa36de6fef326ee1b753e8ec9
+    GIT_SHALLOW FALSE
+
+    PATCH_COMMAND
+        ${CMAKE_COMMAND}
+            -DSOURCE_DIR=<SOURCE_DIR>
+            -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/libajantv2-remove-transfer-success-log.patch
+            -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+            -P ${CMAKE_CURRENT_LIST_DIR}/ApplyAjaPatch.cmake
+)
+
+FetchContent_MakeAvailable(libajantv2)
+
 IF (ENABLE_VULKAN)
     find_package(Vulkan REQUIRED)
 

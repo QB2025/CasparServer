@@ -1,9 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
 project(aja)
 
-set(AJA_ROOT /opt/src/libajantv2)
-set(AJA_BUILD ${AJA_ROOT}/build)
-
 set(SOURCES
     aja.cpp
     aja.h
@@ -20,47 +17,20 @@ casparcg_add_module_project(aja
     INIT_FUNCTION "aja::init"
 )
 
-target_compile_definitions(aja PRIVATE
-    AJALinux
-    AJA_LINUX
-    AJASTATIC
-    AJA_USE_CPLUSPLUS11
-    NTV2_USE_CPLUSPLUS11
-)
-
 target_include_directories(aja PRIVATE
     ..
-    ${AJA_ROOT}
-    ${AJA_ROOT}/ajaanc/includes
-    ${AJA_ROOT}/ajabase
-    ${AJA_ROOT}/ajantv2/includes
-    ${AJA_BUILD}/ajantv2
-    ${AJA_BUILD}/ajantv2/mbedtls-install/include
-    ${AJA_ROOT}/ajantv2/src/lin
-    ${AJA_ROOT}/ajabase/pnp/linux
-    ${AJA_ROOT}/ajabase/system/linux
-    ${AJA_ROOT}/thirdparty/include
     ${FFMPEG_INCLUDE_PATH}
 )
 
 target_link_libraries(aja PRIVATE
-    ${AJA_BUILD}/ajantv2/libajantv2.a
-
-    udev
-    dl
-    pthread
-    rt
-
+    ajantv2
     ${FFMPEG_LIBRARIES}
-
-    ${AJA_BUILD}/ajantv2/mbedtls-install/lib/libmbedtls.a
-    ${AJA_BUILD}/ajantv2/mbedtls-install/lib/libmbedcrypto.a
-    ${AJA_BUILD}/ajantv2/mbedtls-install/lib/libmbedx509.a
-
-    ${AJA_BUILD}/ajantv2/mbedtls-install/lib/libmbedtls.a
-    ${AJA_BUILD}/ajantv2/mbedtls-install/lib/libmbedcrypto.a
-    ${AJA_BUILD}/ajantv2/mbedtls-install/lib/libmbedx509.a
 )
+
+# libajantv2 publishes its own compiler warning/optimization flags as PUBLIC
+# usage requirements. Keep those flags for building libajantv2 itself, but do
+# not propagate them into CasparCG targets that link against it.
+set_property(TARGET ajantv2 PROPERTY INTERFACE_COMPILE_OPTIONS "")
 
 set_target_properties(aja PROPERTIES FOLDER modules)
 source_group(sources ./*)
