@@ -360,6 +360,34 @@ class aja_consumer final : public core::frame_consumer
 
         device_.SetEveryFrameServices(NTV2_OEM_TASKS);
 
+        //
+        // Reference / genlock setup.
+        //
+        // Some AJA devices share the reference input with analog LTC.  Make
+        // sure the connector is in reference mode before probing for sync.
+        //
+        if (device_.features().CanDoLTCInOnRefPort())
+            device_.SetLTCInputEnable(false);
+
+        const NTV2VideoFormat reference_format = device_.GetReferenceVideoFormat();
+
+        if (reference_format == NTV2_FORMAT_UNKNOWN) {
+            CASPAR_LOG(warning) << L"AJA: No reference signal detected; using free-run";
+
+            if (!device_.SetReference(NTV2_REFERENCE_FREERUN)) {
+                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to select AJA free-run reference"));
+            }
+        } else {
+            const std::string reference_name = NTV2VideoFormatToString(reference_format, true);
+
+            CASPAR_LOG(info) << L"AJA: Reference signal detected: "
+                             << std::wstring(reference_name.begin(), reference_name.end());
+
+            if (!device_.SetReference(NTV2_REFERENCE_EXTERNAL)) {
+                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to select AJA external reference"));
+            }
+        }
+
         if (is_uhd) {
             //
             // UHD TSI on the original Corvid44 uses two FrameStores.
@@ -376,8 +404,6 @@ class aja_consumer final : public core::frame_consumer
             device_.SetVANCMode(frame_stores, NTV2_VANCMODE_OFF);
 
             device_.SetVANCShiftMode(frame_stores, NTV2_VANCDATA_NORMAL);
-
-            device_.SetReference(NTV2_REFERENCE_FREERUN);
 
             if (!device_.SetVideoFormat(frame_stores, video_format_, false)) {
                 CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set AJA UHD video format"));
@@ -397,8 +423,6 @@ class aja_consumer final : public core::frame_consumer
             device_.SetVANCMode(NTV2_VANCMODE_OFF, channel_);
 
             device_.SetVANCShiftMode(channel_, NTV2_VANCDATA_NORMAL);
-
-            device_.SetReference(NTV2_REFERENCE_FREERUN);
 
             if (!device_.SetVideoFormat(video_format_, false, false, channel_)) {
                 CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set selected AJA video format"));

@@ -33,9 +33,11 @@ extern "C" {
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <thread>
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_invoke.h>
@@ -47,6 +49,17 @@ namespace {
 constexpr NTV2FrameBufferFormat kPixelFormat         = NTV2_FBF_8BIT_YCBCR;
 constexpr ULWord                kAutoCirculateFrames = 7;
 constexpr ULWord                kAudioChannels       = 16;
+
+// CasparCG constructs a replacement producer before destroying the producer
+// currently on the layer.  AJA AutoCirculate, however, is a device/channel
+// resource rather than an object-local resource.  Track the most recent
+// producer that owns each physical capture channel so an obsolete producer
+// cannot stop or disable hardware already taken over by its replacement.
+using capture_owner_key = std::pair<ULWord, int>;
+
+std::mutex                                  g_capture_owner_mutex;
+std::map<capture_owner_key, std::uint64_t> g_capture_owners;
+std::atomic<std::uint64_t>                 g_next_capture_owner_token{1};
 
 NTV2VideoFormat get_aja_video_format(core::video_format format)
 {
@@ -153,6 +166,11 @@ class aja_producer final : public core::frame_producer
 
     bool auto_circulate_started_ = false;
 
+    const std::uint64_t capture_owner_token_ =
+        g_next_capture_owner_token.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t previous_capture_owner_token_ = 0;
+    bool          capture_ownership_claimed_     = false;
+
     std::chrono::steady_clock::time_point last_no_frame_signal_check_ =
         std::chrono::steady_clock::now();
 
@@ -235,30 +253,42 @@ class aja_producer final : public core::frame_producer
             CASPAR_THROW_EXCEPTION(user_error() << msg_info("Unknown AJA input FORMAT"));
 
         initialize();
-        packaging_thread_ = std::thread([this] { packaging_loop(); });
-        capture_thread_    = std::thread([this] { capture_loop(); });
+
+        // Claim the physical capture channel before the replacement producer
+        // becomes visible to CasparCG.  Once claimed, teardown from the old
+        // producer is no longer allowed to stop/disable this channel.
+        previous_capture_owner_token_ = claim_capture_ownership();
+
+        try {
+            packaging_thread_ = std::thread([this] { packaging_loop(); });
+            capture_thread_    = std::thread([this] { capture_loop(); });
+        } catch (...) {
+            stop_requested_ = true;
+            if (capture_thread_.joinable())
+                capture_thread_.join();
+            if (packaging_thread_.joinable())
+                packaging_thread_.join();
+            rollback_capture_ownership();
+            throw;
+        }
     }
 
     ~aja_producer() override
     {
         stop_requested_ = true;
 
-        try {
-            if (device_.IsOpen())
-                device_.AutoCirculateStop(channel_);
-        } catch (...) {
-        }
+        // Wake/stop our capture only while we still own the physical channel.
+        // A replacement producer may already have started AutoCirculate here.
+        stop_autocirculate_if_owner();
 
         if (capture_thread_.joinable())
             capture_thread_.join();
         if (packaging_thread_.joinable())
             packaging_thread_.join();
 
-        try {
-            device_.AutoCirculateStop(channel_);
-            device_.DisableChannel(channel_);
-        } catch (...) {
-        }
+        // CLEAR/shutdown: we are still owner, so stop and disable normally.
+        // Replacement: ownership has moved, so leave the new producer alone.
+        release_capture_hardware_if_owner();
 
         if (progressive_audio_swr_)
             swr_free(&progressive_audio_swr_);
@@ -345,6 +375,81 @@ class aja_producer final : public core::frame_producer
     core::monitor::state state() const override { return state_; }
 
   private:
+    capture_owner_key capture_owner_key_value() const
+    {
+        return {device_index_, static_cast<int>(channel_)};
+    }
+
+    std::uint64_t claim_capture_ownership()
+    {
+        std::lock_guard<std::mutex> lock(g_capture_owner_mutex);
+        const auto key = capture_owner_key_value();
+        const auto it  = g_capture_owners.find(key);
+        const std::uint64_t previous = it == g_capture_owners.end() ? 0 : it->second;
+        g_capture_owners[key] = capture_owner_token_;
+        capture_ownership_claimed_ = true;
+        return previous;
+    }
+
+    void rollback_capture_ownership() noexcept
+    {
+        if (!capture_ownership_claimed_)
+            return;
+
+        std::lock_guard<std::mutex> lock(g_capture_owner_mutex);
+        const auto key = capture_owner_key_value();
+        const auto it  = g_capture_owners.find(key);
+        if (it != g_capture_owners.end() && it->second == capture_owner_token_) {
+            if (previous_capture_owner_token_ != 0)
+                it->second = previous_capture_owner_token_;
+            else
+                g_capture_owners.erase(it);
+        }
+        capture_ownership_claimed_ = false;
+    }
+
+    void stop_autocirculate_if_owner() noexcept
+    {
+        if (!capture_ownership_claimed_)
+            return;
+
+        std::lock_guard<std::mutex> lock(g_capture_owner_mutex);
+        const auto it = g_capture_owners.find(capture_owner_key_value());
+        if (it == g_capture_owners.end() || it->second != capture_owner_token_)
+            return;
+
+        try {
+            if (device_.IsOpen())
+                device_.AutoCirculateStop(channel_);
+        } catch (...) {
+        }
+    }
+
+    void release_capture_hardware_if_owner() noexcept
+    {
+        if (!capture_ownership_claimed_)
+            return;
+
+        std::lock_guard<std::mutex> lock(g_capture_owner_mutex);
+        const auto key = capture_owner_key_value();
+        const auto it  = g_capture_owners.find(key);
+        if (it == g_capture_owners.end() || it->second != capture_owner_token_) {
+            capture_ownership_claimed_ = false;
+            return;
+        }
+
+        try {
+            if (device_.IsOpen()) {
+                device_.AutoCirculateStop(channel_);
+                device_.DisableChannel(channel_);
+            }
+        } catch (...) {
+        }
+
+        g_capture_owners.erase(it);
+        capture_ownership_claimed_ = false;
+    }
+
     void initialize()
     {
         const NTV2VideoFormat expected_format = get_aja_video_format(input_format_desc_.format);
@@ -589,7 +694,7 @@ class aja_producer final : public core::frame_producer
                 }
             }
 
-            device_.AutoCirculateStop(channel_);
+            stop_autocirculate_if_owner();
             auto_circulate_started_ = false;
         } catch (...) {
             {
@@ -597,11 +702,7 @@ class aja_producer final : public core::frame_producer
                 capture_exception_ = std::current_exception();
             }
 
-            try {
-                device_.AutoCirculateStop(channel_);
-            } catch (...) {
-            }
-
+            stop_autocirculate_if_owner();
             auto_circulate_started_ = false;
         }
     }
