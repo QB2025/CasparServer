@@ -5,6 +5,7 @@ set(SOURCES
 	ogl/image/image_kernel.cpp
 	ogl/image/image_mixer.cpp
 	ogl/image/image_shader.cpp
+	ogl/image/straight_alpha_kernel.cpp
 
 	ogl/util/buffer.cpp
 	ogl/util/context.cpp
@@ -21,6 +22,8 @@ set(HEADERS
 	ogl/image/image_kernel.h
 	ogl/image/image_mixer.h
 	ogl/image/image_shader.h
+	ogl/image/straight_alpha_kernel.h
+
 
 	ogl/util/buffer.h
 	ogl/util/context.h
@@ -110,6 +113,7 @@ IF (ENABLE_VULKAN)
 
 	bin2c("vulkan/image/vertex_shader.spv" "vulkan_image_vertex.h" "caspar::accelerator::vulkan" "vertex_shader")
 	bin2c("vulkan/image/fragment_shader.spv" "vulkan_image_fragment.h" "caspar::accelerator::vulkan" "fragment_shader")
+
 ENDIF()
 
 bin2c("ogl/image/shader.vert" "ogl_image_vertex.h" "caspar::accelerator::ogl" "vertex_shader")

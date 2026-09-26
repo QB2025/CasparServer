@@ -206,7 +206,6 @@ struct image_kernel::impl
         // Setup shader
         shader_->use();
         shader_->set("is_straight_alpha", params.pix_desc.is_straight_alpha);
-        shader_->set("straight_alpha_output", params.straight_alpha_output);
         shader_->set("plane[0]", texture_id::plane0);
         shader_->set("plane[1]", texture_id::plane1);
         shader_->set("plane[2]", texture_id::plane2);

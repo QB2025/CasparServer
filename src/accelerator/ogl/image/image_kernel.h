@@ -54,7 +54,6 @@ struct draw_params final
     std::shared_ptr<class texture>              local_key;
     std::shared_ptr<class texture>              layer_key;
     double                                      aspect_ratio = 1.0;
-    bool                                        straight_alpha_output = false;
     int                                         target_width;
     int                                         target_height;
 };
