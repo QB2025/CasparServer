@@ -78,6 +78,7 @@ source_group(sources\\util util/*)
 if (MSVC)
 	target_link_libraries(decklink PRIVATE
 			ffmpeg
+			comsuppw
 	)
 else()
 	target_link_libraries(decklink PRIVATE
