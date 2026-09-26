@@ -53,6 +53,22 @@ void main()
 }
 )GLSL";
 
+std::shared_ptr<shader> create_straight_alpha_shader(const spl::shared_ptr<device>& ogl)
+{
+    // OpenGL resources must be destroyed on the device thread.
+    std::weak_ptr<device> weak_ogl = ogl;
+
+    auto deleter = [weak_ogl](shader* p) {
+        auto ogl = weak_ogl.lock();
+
+        if (ogl) {
+            ogl->dispatch_async([=] { delete p; });
+        }
+    };
+
+    return std::shared_ptr<shader>(new shader(vertex_shader, fragment_shader), deleter);
+}
+
 } // namespace
 
 struct straight_alpha_kernel::impl
@@ -64,7 +80,7 @@ struct straight_alpha_kernel::impl
 
     explicit impl(const spl::shared_ptr<device>& ogl)
         : ogl_(ogl)
-        , shader_(ogl_->dispatch_sync([] { return spl::make_shared<shader>(vertex_shader, fragment_shader); }))
+        , shader_(ogl_->dispatch_sync([&] { return create_straight_alpha_shader(ogl); }))
     {
         ogl_->dispatch_sync([this] {
             GL(glGenVertexArrays(1, &vao_));
