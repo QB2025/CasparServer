@@ -206,14 +206,18 @@ class aja_consumer final : public core::frame_consumer
     std::vector<uint8_t>      key_buffer_;
     std::vector<std::int32_t> audio_buffer_;
 
-    NTV2AudioSystem audio_system_ = NTV2_AUDIOSYSTEM_1;
+    NTV2AudioSystem audio_system_       = NTV2_AUDIOSYSTEM_1;
+    ULWord          audio_channel_count_ = 0;
 
     ULWord          device_index_ = 0;
-    NTV2Channel     channel_      = NTV2_CHANNEL1;
-    NTV2Channel     key_channel_  = NTV2_CHANNEL_INVALID;
-    NTV2VideoFormat video_format_ = NTV2_FORMAT_UNKNOWN;
+    NTV2Channel     channel_         = NTV2_CHANNEL1;
+    NTV2Channel     key_channel_     = NTV2_CHANNEL_INVALID;
+    NTV2Channel     playout_channel_ = NTV2_CHANNEL1;
+    NTV2Channel     pacing_channel_  = NTV2_CHANNEL1;
+    NTV2VideoFormat video_format_    = NTV2_FORMAT_UNKNOWN;
 
-    bool key_enabled_ = false;
+    bool key_enabled_                  = false;
+    bool legacy_external_key_routing_ = false;
 
     bool   initialized_                = false;
     bool   auto_circulate_started_     = false;
@@ -260,6 +264,7 @@ class aja_consumer final : public core::frame_consumer
 
     std::atomic_bool           output_worker_failed_{false};
 
+
   public:
     aja_consumer(ULWord device_index, NTV2Channel channel, NTV2Channel key_channel = NTV2_CHANNEL_INVALID)
         : device_index_(device_index)
@@ -275,13 +280,13 @@ class aja_consumer final : public core::frame_consumer
 
         try {
             if (auto_circulate_started_) {
-                device_.AutoCirculateStop(channel_);
+                device_.AutoCirculateStop(playout_channel_);
                 auto_circulate_started_ = false;
             }
 
-            device_.DisableChannel(channel_);
+            device_.DisableChannel(playout_channel_);
 
-            if (key_enabled_)
+            if (key_enabled_ && key_channel_ != playout_channel_)
                 device_.DisableChannel(key_channel_);
         } catch (...) {
         }
@@ -340,6 +345,32 @@ class aja_consumer final : public core::frame_consumer
                 CASPAR_THROW_EXCEPTION(user_error()
                                        << msg_info("Selected AJA device does not support requested key channel"));
             }
+        }
+
+        // Legacy two-FrameStore / one-CSC devices (notably KONA LHe+) have
+        // asymmetric resources: SDI input 1 captures through FrameStore 1, while
+        // external fill/key can be produced from FrameStore 2 through CSC1.
+        // Keep the configured channel/key-channel as the physical SDI pair and
+        // select the internal playout FrameStore independently.
+        legacy_external_key_routing_ =
+            key_enabled_ && !is_uhd &&
+            device_.features().GetNumFrameStores() == 2 &&
+            device_.features().GetNumCSCs() == 1 &&
+            channel_ == NTV2_CHANNEL1 && key_channel_ == NTV2_CHANNEL2;
+
+        playout_channel_ = legacy_external_key_routing_ ? NTV2_CHANNEL2 : channel_;
+        pacing_channel_  = legacy_external_key_routing_ ? NTV2_CHANNEL1 : playout_channel_;
+
+        if (legacy_external_key_routing_) {
+            CASPAR_LOG(info) << L"AJA: using legacy external-key routing: FS2 ARGB -> CSC1 -> SDI1 fill / SDI2 key";
+            CASPAR_LOG(info) << L"AJA: legacy external-key pacing uses FS1 vertical events";
+        }
+
+        if (legacy_external_key_routing_) {
+            const std::size_t argb_frame_buffer_size =
+                static_cast<std::size_t>(format_desc.width) * static_cast<std::size_t>(format_desc.height) * 4u;
+            video_buffer_.resize(argb_frame_buffer_size);
+            key_buffer_.clear();
         }
 
         if (is_uhd && channel_ != NTV2_CHANNEL1) {
@@ -414,34 +445,38 @@ class aja_consumer final : public core::frame_consumer
                                        << msg_info("Unable to set AJA UHD framebuffer format to 8-bit YCbCr"));
             }
         } else {
-            if (!device_.EnableChannel(channel_)) {
-                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to enable selected AJA channel"));
+            if (!device_.EnableChannel(playout_channel_)) {
+                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to enable selected AJA playout channel"));
             }
 
-            device_.SetMode(channel_, NTV2_MODE_DISPLAY);
+            device_.SetMode(playout_channel_, NTV2_MODE_DISPLAY);
+            device_.SetVANCMode(NTV2_VANCMODE_OFF, playout_channel_);
+            device_.SetVANCShiftMode(playout_channel_, NTV2_VANCDATA_NORMAL);
 
-            device_.SetVANCMode(NTV2_VANCMODE_OFF, channel_);
-
-            device_.SetVANCShiftMode(channel_, NTV2_VANCDATA_NORMAL);
-
-            if (!device_.SetVideoFormat(video_format_, false, false, channel_)) {
-                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set selected AJA video format"));
+            if (!device_.SetVideoFormat(video_format_, false, false, playout_channel_)) {
+                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set selected AJA playout video format"));
             }
 
-            if (!device_.SetFrameBufferFormat(channel_, kPixelFormat)) {
+            const NTV2FrameBufferFormat playout_pixel_format =
+                legacy_external_key_routing_ ? NTV2_FBF_ARGB : kPixelFormat;
+
+            if (!device_.SetFrameBufferFormat(playout_channel_, playout_pixel_format)) {
                 CASPAR_THROW_EXCEPTION(caspar_exception()
-                                       << msg_info("Unable to set AJA framebuffer format to 8-bit YCbCr"));
+                                       << msg_info(legacy_external_key_routing_
+                                                       ? "Unable to set AJA framebuffer format to ARGB"
+                                                       : "Unable to set AJA framebuffer format to 8-bit YCbCr"));
             }
 
-            if (key_enabled_) {
+            // Generic external key uses a second YCbCr FrameStore.  Grandpa's
+            // legacy path instead extracts alpha in CSC1, so no second key
+            // FrameStore is configured here.
+            if (key_enabled_ && !legacy_external_key_routing_) {
                 if (!device_.EnableChannel(key_channel_)) {
                     CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to enable AJA key channel"));
                 }
 
                 device_.SetMode(key_channel_, NTV2_MODE_DISPLAY);
-
                 device_.SetVANCMode(NTV2_VANCMODE_OFF, key_channel_);
-
                 device_.SetVANCShiftMode(key_channel_, NTV2_VANCDATA_NORMAL);
 
                 if (!device_.SetVideoFormat(video_format_, false, false, key_channel_)) {
@@ -522,6 +557,12 @@ class aja_consumer final : public core::frame_consumer
 
                 connections.insert(NTV2XptConnection(NTV2_XptSDIOut2InputDS2, NTV2_Xpt425Mux2BYUV));
             }
+        } else if (legacy_external_key_routing_) {
+            // Proven KONA LHe+ external-key topology:
+            //   FS2 ARGB -> CSC1 -> SDI1 fill + SDI2 key.
+            connections.insert(NTV2XptConnection(NTV2_XptCSC1VidInput, NTV2_XptFrameBuffer2RGB));
+            connections.insert(NTV2XptConnection(GetSDIOutputInputXpt(channel_), NTV2_XptCSC1VidYUV));
+            connections.insert(NTV2XptConnection(GetSDIOutputInputXpt(key_channel_), NTV2_XptCSC1KeyYUV));
         } else {
             const NTV2OutputXptID source_xpt = GetFrameStoreOutputXptFromChannel(channel_, false);
 
@@ -550,8 +591,24 @@ class aja_consumer final : public core::frame_consumer
             }
         }
 
-        device_.AutoCirculateStop(channel_);
-        device_.WaitForOutputVerticalInterrupt(channel_, 4);
+        // Legacy KONA LHe+ may pace FS2 playout from FS1 vertical events.
+        // This is particularly important on legacy two-FrameStore devices where
+        // output may use FrameStore 2 while FrameStore 1 is active for capture.
+        if (!device_.EnableOutputInterrupt(pacing_channel_)) {
+            CASPAR_THROW_EXCEPTION(caspar_exception()
+                                   << msg_info("Unable to enable AJA output vertical interrupt"));
+        }
+
+        if (!device_.SubscribeOutputVerticalEvent(pacing_channel_)) {
+            CASPAR_THROW_EXCEPTION(caspar_exception()
+                                   << msg_info("Unable to subscribe to AJA output vertical event"));
+        }
+
+        // Do not issue AutoCirculateStop + WaitForOutputVerticalInterrupt here.
+        //
+        // On legacy two-FrameStore devices such as KONA LHe+, that pre-initialization
+        // sequence can stall FrameStore 2 output while FrameStore 1 is active for
+        // capture. AutoCirculateInitForOutput below establishes a fresh output ring.
 
         audio_system_ = NTV2_AUDIOSYSTEM_1;
 
@@ -566,6 +623,8 @@ class aja_consumer final : public core::frame_consumer
         if (num_audio_channels > 8 && !device_.features().CanDo2110() && NTV2_IS_2K_1080_VIDEO_FORMAT(video_format_)) {
             num_audio_channels = 8;
         }
+
+        audio_channel_count_ = num_audio_channels;
 
         device_.SetNumberAudioChannels(num_audio_channels, audio_system_);
 
@@ -589,16 +648,16 @@ class aja_consumer final : public core::frame_consumer
 
         device_.SetAudioLoopBack(NTV2_AUDIO_LOOPBACK_OFF, audio_system_);
 
-        const UByte auto_circulate_channels = key_enabled_ ? 2 : 1;
+        const UByte auto_circulate_channels = (key_enabled_ && !legacy_external_key_routing_) ? 2 : 1;
 
         if (!device_.AutoCirculateInitForOutput(
-                channel_, 7, audio_system_, AUTOCIRCULATE_WITH_RP188, auto_circulate_channels)) {
+                playout_channel_, 7, audio_system_, AUTOCIRCULATE_WITH_RP188, auto_circulate_channels)) {
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to initialize AJA AutoCirculate output"));
         }
 
         AUTOCIRCULATE_STATUS ac_status;
 
-        if (!device_.AutoCirculateGetStatus(channel_, ac_status)) {
+        if (!device_.AutoCirculateGetStatus(playout_channel_, ac_status)) {
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to query AJA AutoCirculate status"));
         }
 
@@ -614,7 +673,8 @@ class aja_consumer final : public core::frame_consumer
 
         CASPAR_LOG(info) << L"AJA consumer initialized: device " << (device_index_ + 1) << L", channel "
                          << (static_cast<int>(channel_) + 1) << L", " << format_desc_.name
-                         << L", 8-bit YCbCr, AJA audio system configured";
+                         << (legacy_external_key_routing_ ? L", 8-bit ARGB" : L", 8-bit YCbCr")
+                         << L", AJA audio system configured";
     }
 
     bool prepare_output_frame(core::video_field field,
@@ -652,12 +712,21 @@ class aja_consumer final : public core::frame_consumer
             if (interlaced) {
                 const int first_line = field == core::video_field::a ? 0 : 1;
 
-                bgra_field_to_interlaced_uyvy(
-                    image.data(), video_buffer_.data(), format_desc_.width, format_desc_.height, first_line);
+                if (legacy_external_key_routing_) {
+                    const std::size_t line_bytes = static_cast<std::size_t>(format_desc_.width) * 4u;
+                    for (int y = first_line; y < format_desc_.height; y += 2) {
+                        std::memcpy(video_buffer_.data() + static_cast<std::size_t>(y) * line_bytes,
+                                    image.data() + static_cast<std::size_t>(y) * line_bytes,
+                                    line_bytes);
+                    }
+                } else {
+                    bgra_field_to_interlaced_uyvy(
+                        image.data(), video_buffer_.data(), format_desc_.width, format_desc_.height, first_line);
 
-                if (key_enabled_) {
-                    bgra_field_to_interlaced_key_uyvy(
-                        image.data(), key_buffer_.data(), format_desc_.width, format_desc_.height, first_line);
+                    if (key_enabled_) {
+                        bgra_field_to_interlaced_key_uyvy(
+                            image.data(), key_buffer_.data(), format_desc_.width, format_desc_.height, first_line);
+                    }
                 }
 
                 if (field == core::video_field::a)
@@ -672,24 +741,52 @@ class aja_consumer final : public core::frame_consumer
                 // The completed frame is copied into an owned prepared-frame slot
                 // before the AJA output worker sees it.
                 prepared.video = video_buffer_;
-                if (key_enabled_)
+                if (key_enabled_ && !legacy_external_key_routing_)
                     prepared.key = key_buffer_;
-                prepared.audio = audio_buffer_;
+                constexpr std::size_t caspar_audio_channels = 16;
+                const std::size_t aja_audio_channels =
+                    static_cast<std::size_t>(audio_channel_count_);
+
+                if (aja_audio_channels > 0 &&
+                    aja_audio_channels < caspar_audio_channels &&
+                    audio_buffer_.size() % caspar_audio_channels == 0) {
+                    const std::size_t sample_frames =
+                        audio_buffer_.size() / caspar_audio_channels;
+
+                    prepared.audio.resize(sample_frames * aja_audio_channels);
+
+                    for (std::size_t sample = 0; sample < sample_frames; ++sample) {
+                        const auto* src =
+                            audio_buffer_.data() + sample * caspar_audio_channels;
+                        auto* dst =
+                            prepared.audio.data() + sample * aja_audio_channels;
+
+                        std::copy_n(src, aja_audio_channels, dst);
+                    }
+                } else {
+                    prepared.audio = audio_buffer_;
+                }
+
                 frame_ready = true;
                 return true;
             }
 
             const std::size_t raster_bytes =
-                static_cast<std::size_t>(format_desc_.width) * static_cast<std::size_t>(format_desc_.height) * 2u;
+                static_cast<std::size_t>(format_desc_.width) * static_cast<std::size_t>(format_desc_.height) *
+                (legacy_external_key_routing_ ? 4u : 2u);
             if (prepared.video.size() != raster_bytes)
                 prepared.video.resize(raster_bytes);
 
-            bgra_to_uyvy(image.data(), prepared.video.data(), format_desc_.width, format_desc_.height);
+            if (legacy_external_key_routing_) {
+                std::memcpy(prepared.video.data(), image.data(), expected);
+            } else {
+                bgra_to_uyvy(image.data(), prepared.video.data(), format_desc_.width, format_desc_.height);
 
-            if (key_enabled_) {
-                if (prepared.key.size() != prepared.video.size())
-                    prepared.key.resize(prepared.video.size());
-                bgra_to_key_uyvy(image.data(), prepared.key.data(), format_desc_.width, format_desc_.height);
+                if (key_enabled_) {
+                    if (prepared.key.size() != prepared.video.size())
+                        prepared.key.resize(prepared.video.size());
+                    bgra_to_key_uyvy(image.data(), prepared.key.data(), format_desc_.width, format_desc_.height);
+                }
             }
 
             prepared.audio.assign(audio.begin(), audio.end());
@@ -705,7 +802,7 @@ class aja_consumer final : public core::frame_consumer
     {
         try {
             AUTOCIRCULATE_STATUS status;
-            if (!device_.AutoCirculateGetStatus(channel_, status))
+            if (!device_.AutoCirculateGetStatus(playout_channel_, status))
                 return false;
 
             constexpr ULWord kAcTargetFill = 5;
@@ -720,11 +817,10 @@ class aja_consumer final : public core::frame_consumer
             };
 
             while (!ac_may_accept_for_target_fill(status)) {
-                device_.WaitForOutputVerticalInterrupt(channel_);
-                if (!device_.AutoCirculateGetStatus(channel_, status))
+                device_.WaitForOutputVerticalInterrupt(pacing_channel_);
+                if (!device_.AutoCirculateGetStatus(playout_channel_, status))
                     return false;
             }
-
             AUTOCIRCULATE_TRANSFER transfer;
             transfer.SetVideoBuffer(reinterpret_cast<ULWord*>(prepared.video.data()),
                                     static_cast<ULWord>(prepared.video.size()));
@@ -734,7 +830,7 @@ class aja_consumer final : public core::frame_consumer
                                         static_cast<ULWord>(prepared.audio.size() * sizeof(std::int32_t)));
             }
 
-            if (key_enabled_) {
+            if (key_enabled_ && !legacy_external_key_routing_) {
                 const LWord stride           = fill_end_frame_ - fill_start_frame_ + 1;
                 const LWord key_device_frame = next_fill_frame_ + stride;
 
@@ -747,12 +843,12 @@ class aja_consumer final : public core::frame_consumer
                 transfer.acDesiredFrame = next_fill_frame_;
             }
 
-            if (!device_.AutoCirculateTransfer(channel_, transfer)) {
+            if (!device_.AutoCirculateTransfer(playout_channel_, transfer)) {
                 CASPAR_LOG(error) << L"AJA AutoCirculateTransfer failed";
                 return false;
             }
 
-            if (key_enabled_) {
+            if (key_enabled_ && !legacy_external_key_routing_) {
                 if (next_fill_frame_ >= fill_end_frame_)
                     next_fill_frame_ = fill_start_frame_;
                 else
@@ -762,7 +858,7 @@ class aja_consumer final : public core::frame_consumer
             ++successful_frame_transfers_;
 
             if (!auto_circulate_started_ && successful_frame_transfers_ >= 5) {
-                if (!device_.AutoCirculateStart(channel_)) {
+                if (!device_.AutoCirculateStart(playout_channel_)) {
                     CASPAR_LOG(error) << L"Unable to start AJA AutoCirculate frame output";
                     return false;
                 }
@@ -812,12 +908,13 @@ class aja_consumer final : public core::frame_consumer
             prepared_free_slots_.clear();
 
             const std::size_t raster_bytes =
-                static_cast<std::size_t>(format_desc_.width) * static_cast<std::size_t>(format_desc_.height) * 2u;
+                static_cast<std::size_t>(format_desc_.width) * static_cast<std::size_t>(format_desc_.height) *
+                (legacy_external_key_routing_ ? 4u : 2u);
 
             for (std::size_t i = 0; i < kPreparedQueueCapacity + 2; ++i) {
                 auto slot = std::make_unique<prepared_output_frame>();
                 slot->video.resize(raster_bytes);
-                if (key_enabled_)
+                if (key_enabled_ && !legacy_external_key_routing_)
                     slot->key.resize(raster_bytes);
                 prepared_free_slots_.push_back(std::move(slot));
             }

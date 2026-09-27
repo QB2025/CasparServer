@@ -48,7 +48,7 @@ namespace {
 
 constexpr NTV2FrameBufferFormat kPixelFormat         = NTV2_FBF_8BIT_YCBCR;
 constexpr ULWord                kAutoCirculateFrames = 7;
-constexpr ULWord                kAudioChannels       = 16;
+constexpr ULWord                kCasparAudioChannels = 16;
 
 // CasparCG constructs a replacement producer before destroying the producer
 // currently on the layer.  AJA AutoCirculate, however, is a device/channel
@@ -118,7 +118,8 @@ class aja_producer final : public core::frame_producer
     CNTV2Card       device_;
     NTV2InputSource input_source_ = NTV2_INPUTSOURCE_INVALID;
     NTV2VideoFormat input_format_ = NTV2_FORMAT_UNKNOWN;
-    NTV2AudioSystem audio_system_ = NTV2_AUDIOSYSTEM_1;
+    NTV2AudioSystem audio_system_       = NTV2_AUDIOSYSTEM_1;
+    ULWord          aja_audio_channels_ = 0;
 
     std::size_t width_  = 0;
     std::size_t height_ = 0;
@@ -552,8 +553,20 @@ class aja_producer final : public core::frame_producer
                 audio_system_, NTV2_AUDIO_EMBEDDED, ::NTV2InputSourceToEmbeddedAudioInput(input_source_)))
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to select AJA embedded audio input"));
 
-        if (!device_.SetNumberAudioChannels(kAudioChannels, audio_system_))
-            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to configure 16-channel AJA audio input"));
+        aja_audio_channels_ = static_cast<ULWord>(device_.features().GetMaxAudioChannels());
+        if (aja_audio_channels_ == 0 || aja_audio_channels_ > kCasparAudioChannels)
+            CASPAR_THROW_EXCEPTION(caspar_exception()
+                                   << msg_info("Unsupported AJA embedded audio channel count"));
+
+        if (!device_.SetNumberAudioChannels(aja_audio_channels_, audio_system_))
+            CASPAR_THROW_EXCEPTION(caspar_exception()
+                                   << msg_info("Unable to configure AJA embedded audio input"));
+
+        ULWord configured_audio_channels = 0;
+        if (!device_.GetNumberAudioChannels(configured_audio_channels, audio_system_) ||
+            configured_audio_channels != aja_audio_channels_)
+            CASPAR_THROW_EXCEPTION(caspar_exception()
+                                   << msg_info("AJA embedded audio channel configuration did not take effect"));
 
         if (!device_.SetAudioRate(NTV2_AUDIO_48K, audio_system_))
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to configure AJA audio rate"));
@@ -603,11 +616,13 @@ class aja_producer final : public core::frame_producer
         state_["channel"]           = static_cast<int64_t>(static_cast<int>(channel_) + 1);
         state_["format"]            = input_format_desc_.name;
         state_["audio/sample-rate"] = static_cast<int64_t>(48000);
-        state_["audio/channels"]    = static_cast<int64_t>(kAudioChannels);
+        state_["audio/channels"]    = static_cast<int64_t>(kCasparAudioChannels);
+        state_["audio/hardware-channels"] = static_cast<int64_t>(aja_audio_channels_);
 
         CASPAR_LOG(info) << L"AJA producer initialized: device " << (device_index_ + 1) << L", input channel "
                          << (static_cast<int>(channel_) + 1) << L", detected " << input_format_desc_.name
-                         << L", 16-channel 48 kHz embedded audio";
+                         << L", " << aja_audio_channels_ << L"-channel 48 kHz embedded audio"
+                         << L" -> " << kCasparAudioChannels << L"-channel Caspar layout";
     }
 
     void monitor_signal_without_frame()
@@ -657,11 +672,12 @@ class aja_producer final : public core::frame_producer
                     if (!input_frame_is_stable())
                         continue;
 
-                    const ULWord audio_bytes            = transfer.GetCapturedAudioByteCount();
-                    const ULWord bytes_per_sample_frame = kAudioChannels * sizeof(std::int32_t);
+                    const ULWord audio_bytes = transfer.GetCapturedAudioByteCount();
+                    const ULWord hardware_bytes_per_sample_frame =
+                        aja_audio_channels_ * sizeof(std::int32_t);
 
                     if (audio_bytes == 0 || audio_bytes > capture_audio_buffer_.size() ||
-                        audio_bytes % bytes_per_sample_frame != 0) {
+                        audio_bytes % hardware_bytes_per_sample_frame != 0) {
                         CASPAR_LOG(warning) << print() << L" invalid captured audio byte count: " << audio_bytes;
                         continue;
                     }
@@ -671,8 +687,23 @@ class aja_producer final : public core::frame_producer
                     raw.sequence   = capture_sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
                     raw.uyvy.resize(capture_buffer_.size());
                     std::memcpy(raw.uyvy.data(), capture_buffer_.data(), capture_buffer_.size());
-                    raw.audio.resize(audio_bytes / sizeof(std::int32_t));
-                    std::memcpy(raw.audio.data(), capture_audio_buffer_.data(), audio_bytes);
+
+                    // AJA transfers are interleaved using the hardware audio-system
+                    // channel count. Normalize immediately to CasparCG's fixed
+                    // 16-channel layout so all downstream queue, interlaced A/B,
+                    // and progressive audio logic remains unchanged.
+                    const std::size_t captured_sample_frames =
+                        audio_bytes / hardware_bytes_per_sample_frame;
+                    raw.audio.assign(captured_sample_frames * kCasparAudioChannels, 0);
+
+                    const auto* hardware_audio =
+                        reinterpret_cast<const std::int32_t*>(capture_audio_buffer_.data());
+
+                    for (std::size_t sample = 0; sample < captured_sample_frames; ++sample) {
+                        std::copy_n(hardware_audio + sample * aja_audio_channels_,
+                                    aja_audio_channels_,
+                                    raw.audio.data() + sample * kCasparAudioChannels);
+                    }
 
 
                     {
@@ -785,8 +816,11 @@ class aja_producer final : public core::frame_producer
         const bool          have_sdi_status =
             device_.ReadSDIStatistics(stats) && stats.GetSDIInputStatus(input_status, static_cast<UWord>(channel_));
 
+        const bool format_good = detected_format == input_format_;
+
         const bool receiver_good =
-            detected_format == input_format_ && have_sdi_status && input_status.mLocked && !input_status.mFrameTRSError;
+            format_good &&
+            (!have_sdi_status || (input_status.mLocked && !input_status.mFrameTRSError));
 
         if (!receiver_good) {
             if (signal_was_good_) {
@@ -961,7 +995,7 @@ class aja_producer final : public core::frame_producer
                                     : core::draw_frame::empty();
 
         const std::size_t requested_frames = static_cast<std::size_t>(requested_samples);
-        const std::size_t requested_values = requested_frames * kAudioChannels;
+        const std::size_t requested_values = requested_frames * kCasparAudioChannels;
         const std::size_t available_values =
             progressive_audio_.size() > progressive_audio_offset_
                 ? progressive_audio_.size() - progressive_audio_offset_
@@ -973,7 +1007,7 @@ class aja_producer final : public core::frame_producer
         // Preserve V4.3's startup/recovery shock absorber.  The external FIFO
         // is the authoritative reserve; SWR is not allowed to become the
         // reservoir.
-        const std::size_t available_frames = available_values / kAudioChannels;
+        const std::size_t available_frames = available_values / kCasparAudioChannels;
         if (!progressive_audio_started_ &&
             available_frames >= kProgressiveAudioTargetFrames) {
             progressive_audio_started_ = true;
@@ -1083,10 +1117,10 @@ class aja_producer final : public core::frame_producer
 
                 const uint8_t* topup_input_ptr = reinterpret_cast<const uint8_t*>(
                     progressive_audio_.data() + progressive_audio_offset_ +
-                    consumed_input_frames * kAudioChannels);
+                    consumed_input_frames * kCasparAudioChannels);
                 const uint8_t* topup_input_planes[1] = {topup_input_ptr};
                 uint8_t* topup_output_ptr = reinterpret_cast<uint8_t*>(
-                    audio_frame.data() + static_cast<std::size_t>(produced_frames) * kAudioChannels);
+                    audio_frame.data() + static_cast<std::size_t>(produced_frames) * kCasparAudioChannels);
                 uint8_t* topup_output_planes[1] = {topup_output_ptr};
 
                 const int topup_produced = swr_convert(progressive_audio_swr_,
@@ -1102,7 +1136,7 @@ class aja_producer final : public core::frame_producer
                 produced_frames += topup_produced;
             }
 
-            progressive_audio_offset_ += consumed_input_frames * kAudioChannels;
+            progressive_audio_offset_ += consumed_input_frames * kCasparAudioChannels;
             if (!progressive_audio_swr_primed_ && consumed_input_frames > 0)
                 progressive_audio_swr_primed_ = true;
 
@@ -1176,18 +1210,18 @@ class aja_producer final : public core::frame_producer
         auto& uyvy  = captured.uyvy;
         auto& audio = captured.audio;
 
-        const std::size_t captured_sample_frames = audio.size() / kAudioChannels;
+        const std::size_t captured_sample_frames = audio.size() / kCasparAudioChannels;
 
         const std::size_t requested =
             requested_samples_per_field > 0 ? static_cast<std::size_t>(requested_samples_per_field) : 0u;
 
         if (input_format_desc_.field_count == 2) {
-            std::vector<std::int32_t> audio_a(requested * kAudioChannels, 0);
-            std::vector<std::int32_t> audio_b(requested * kAudioChannels, 0);
+            std::vector<std::int32_t> audio_a(requested * kCasparAudioChannels, 0);
+            std::vector<std::int32_t> audio_b(requested * kCasparAudioChannels, 0);
 
             const std::size_t copy_a_frames = std::min(requested, captured_sample_frames);
             if (copy_a_frames) {
-                std::memcpy(audio_a.data(), audio.data(), copy_a_frames * kAudioChannels * sizeof(std::int32_t));
+                std::memcpy(audio_a.data(), audio.data(), copy_a_frames * kCasparAudioChannels * sizeof(std::int32_t));
             }
 
             const std::size_t remaining_frames =
@@ -1195,18 +1229,18 @@ class aja_producer final : public core::frame_producer
             const std::size_t copy_b_frames = std::min(requested, remaining_frames);
             if (copy_b_frames) {
                 std::memcpy(audio_b.data(),
-                            audio.data() + copy_a_frames * kAudioChannels,
-                            copy_b_frames * kAudioChannels * sizeof(std::int32_t));
+                            audio.data() + copy_a_frames * kCasparAudioChannels,
+                            copy_b_frames * kCasparAudioChannels * sizeof(std::int32_t));
             }
 
             latched_frame_a_ = make_caspar_frame(uyvy, audio_a.data(), audio_a.size());
             latched_frame_b_ = make_caspar_frame(uyvy, audio_b.data(), audio_b.size());
         } else {
-            std::vector<std::int32_t> audio_frame(requested * kAudioChannels, 0);
+            std::vector<std::int32_t> audio_frame(requested * kCasparAudioChannels, 0);
             const std::size_t         copy_frames = std::min(requested, captured_sample_frames);
 
             if (copy_frames) {
-                std::memcpy(audio_frame.data(), audio.data(), copy_frames * kAudioChannels * sizeof(std::int32_t));
+                std::memcpy(audio_frame.data(), audio.data(), copy_frames * kCasparAudioChannels * sizeof(std::int32_t));
             }
 
             latched_frame_a_ = make_caspar_frame(uyvy, audio_frame.data(), audio_frame.size());
