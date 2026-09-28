@@ -107,10 +107,14 @@ if (ENABLE_HTML)
     else()
         casparcg_add_external_project(cef)
         ExternalProject_Add(cef
-            URL ${CASPARCG_DOWNLOAD_MIRROR}/cef/cef_binary_142.0.17+g60aac24+chromium-142.0.7444.176_linux64_minimal.tar.bz2
-            URL_HASH SHA256=1d89e19b2f446105f9a1fe6fdc96bced86249b5884241dcc4013b7c94dabf424
+            URL https://cef-builds.spotifycdn.com/cef_binary_154.0.28%2Bg564dd6c%2Bchromium-154.0.8037.58_linux64_minimal.tar.bz2
+            URL_HASH SHA256=bbda02696d5e08f0844f131516a0bdfab301ab33e868bda14cbde93fe876cb03
             DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
-            CMAKE_ARGS -DUSE_SANDBOX=Off
+            CMAKE_ARGS
+                -DUSE_SANDBOX=Off
+                -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+                -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+                -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
             INSTALL_COMMAND ""
             BUILD_BYPRODUCTS
                 "<SOURCE_DIR>/Release/libcef.so"
@@ -137,8 +141,6 @@ if (ENABLE_HTML)
 
         install(FILES ${SOURCE_DIR}/Release/chrome-sandbox TYPE LIB)
         install(FILES ${SOURCE_DIR}/Release/libcef.so TYPE LIB)
-        install(FILES ${SOURCE_DIR}/Release/libEGL.so TYPE LIB)
-        install(FILES ${SOURCE_DIR}/Release/libGLESv2.so TYPE LIB)
         install(FILES ${SOURCE_DIR}/Release/libvk_swiftshader.so TYPE LIB)
         install(FILES ${SOURCE_DIR}/Release/libvulkan.so.1 TYPE LIB)
         install(FILES ${SOURCE_DIR}/Release/v8_context_snapshot.bin TYPE LIB)
