@@ -69,6 +69,9 @@ class image_mixer final : public core::image_mixer
     void              pop() override;
     common::bit_depth depth() const override;
 
+    void set_straight_alpha_output(bool enabled) override;
+    bool get_straight_alpha_output() const override;
+
   private:
     struct impl;
     std::shared_ptr<impl> impl_;

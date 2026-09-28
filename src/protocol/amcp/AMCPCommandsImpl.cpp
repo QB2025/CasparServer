@@ -1348,6 +1348,31 @@ std::wstring mixer_mastervolume_command(command_context& ctx)
     return L"202 MIXER OK\r\n";
 }
 
+std::wstring mixer_straight_alpha_output_command(command_context& ctx)
+{
+    if (ctx.parameters.empty()) {
+        const bool enabled = ctx.channel.raw_channel->mixer().get_straight_alpha_output();
+
+        return L"201 MIXER OK\r\n" + std::to_wstring(enabled ? 1 : 0) + L"\r\n";
+    }
+
+    const auto value = boost::to_upper_copy(ctx.parameters.at(0));
+
+    bool enabled;
+
+    if (value == L"1" || value == L"TRUE") {
+        enabled = true;
+    } else if (value == L"0" || value == L"FALSE") {
+        enabled = false;
+    } else {
+        return L"400 MIXER ERROR\r\n";
+    }
+
+    ctx.channel.raw_channel->mixer().set_straight_alpha_output(enabled);
+
+    return L"202 MIXER OK\r\n";
+}
+
 std::wstring mixer_grid_command(command_context& ctx)
 {
     transforms_applier transforms(ctx);
@@ -1788,6 +1813,7 @@ void register_commands(std::shared_ptr<amcp_command_repository_wrapper>& repo)
     repo->register_channel_command(L"Mixer Commands", L"MIXER PERSPECTIVE", mixer_perspective_command, 0);
     repo->register_channel_command(L"Mixer Commands", L"MIXER VOLUME", mixer_volume_command, 0);
     repo->register_channel_command(L"Mixer Commands", L"MIXER MASTERVOLUME", mixer_mastervolume_command, 0);
+    repo->register_channel_command(L"Mixer Commands", L"MIXER STRAIGHT_ALPHA_OUTPUT", mixer_straight_alpha_output_command, 0);
     repo->register_channel_command(L"Mixer Commands", L"MIXER GRID", mixer_grid_command, 1);
     repo->register_channel_command(L"Mixer Commands", L"MIXER COMMIT", mixer_commit_command, 0);
     repo->register_channel_command(L"Mixer Commands", L"MIXER CLEAR", mixer_clear_command, 0);
