@@ -20,3 +20,7 @@ override_dh_gencontrol:
 	CASPARCG_CEF_VER=$(dpkg-query -W -f='${Version}' casparcg-cef-142)
 	sed -i "s/@CASPARCG_CEF_VER@/${CASPARCG_CEF_VER}/" debian/control
 	dh_gencontrol
+
+# Skip debug-info optimization for prebuilt CEF binaries.
+override_dh_dwz:
+	dh_dwz -Xchrome-sandbox -Xlibcef.so -Xlibvk_swiftshader.so -Xlibvulkan.so.1
