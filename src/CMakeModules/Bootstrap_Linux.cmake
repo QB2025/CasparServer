@@ -105,10 +105,31 @@ if (ENABLE_HTML)
             "${CEF_LIB_PATH}/libcef_dll_wrapper.a"
         )
     else()
+        set(CEF_LOCAL_ROOT "" CACHE PATH "Path to an extracted CEF binary distribution")
+        if(CEF_LOCAL_ROOT)
+            get_filename_component(CEF_LOCAL_ROOT "${CEF_LOCAL_ROOT}" ABSOLUTE)
+            foreach(required
+                    include/cef_version.h
+                    libcef_dll/CMakeLists.txt
+                    Release/libcef.so
+                    Resources/resources.pak)
+                if(NOT EXISTS "${CEF_LOCAL_ROOT}/${required}")
+                    message(FATAL_ERROR "CEF_LOCAL_ROOT is missing ${required}: ${CEF_LOCAL_ROOT}")
+                endif()
+            endforeach()
+            set(CEF_SOURCE_OPTIONS
+                SOURCE_DIR "${CEF_LOCAL_ROOT}"
+                DOWNLOAD_COMMAND ""
+                UPDATE_COMMAND "")
+        else()
+            set(CEF_SOURCE_OPTIONS
+                URL https://cef-builds.spotifycdn.com/cef_binary_154.0.28%2Bg564dd6c%2Bchromium-154.0.8037.58_linux64_minimal.tar.bz2
+                URL_HASH SHA256=bbda02696d5e08f0844f131516a0bdfab301ab33e868bda14cbde93fe876cb03)
+        endif()
+
         casparcg_add_external_project(cef)
         ExternalProject_Add(cef
-            URL https://cef-builds.spotifycdn.com/cef_binary_154.0.28%2Bg564dd6c%2Bchromium-154.0.8037.58_linux64_minimal.tar.bz2
-            URL_HASH SHA256=bbda02696d5e08f0844f131516a0bdfab301ab33e868bda14cbde93fe876cb03
+            ${CEF_SOURCE_OPTIONS}
             DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
             CMAKE_ARGS
                 -DUSE_SANDBOX=Off
