@@ -441,27 +441,28 @@ struct ffmpeg_consumer : public core::frame_consumer
     {
         state_["file/path"] = u8(path_);
 
-        queue_diagnostics_ = args_.find("-stream-frame-buffer") != std::string::npos ||
-                             args_.find("-stream-packet-buffer") != std::string::npos;
         // Consumer-only options: remove these before forwarding args to FFmpeg.
-        const auto read_queue_capacity = [&](const std::string& name, int fallback) {
+        const auto read_consumer_integer = [&](const std::string& name, int fallback, int minimum, int maximum) {
+            const auto requirement = " requires an integer from " + std::to_string(minimum) + " to " +
+                                     std::to_string(maximum);
             int value = fallback;
             const boost::regex expression("(^|\\s)-" + name + "(?:\\s+([^\\s]+))?");
             boost::smatch match;
             while (boost::regex_search(args_, match, expression)) {
                 if (!match[2].matched)
-                    throw std::invalid_argument(name + " requires an integer from 1 to 256");
+                    throw std::invalid_argument(name + requirement);
                 const auto text = match[2].str();
                 std::size_t consumed = 0;
                 value = std::stoi(text, &consumed);
-                if (consumed != text.size() || value < 1 || value > 256)
-                    throw std::invalid_argument(name + " must be an integer from 1 to 256");
+                if (consumed != text.size() || value < minimum || value > maximum)
+                    throw std::invalid_argument(name + requirement);
                 args_.erase(static_cast<std::size_t>(match.position()), static_cast<std::size_t>(match.length()));
             }
             return value;
         };
-        frame_buffer_capacity_ = read_queue_capacity("stream-frame-buffer", realtime_ ? 1 : 64);
-        packet_buffer_capacity_ = read_queue_capacity("stream-packet-buffer", realtime_ ? 1 : 128);
+        frame_buffer_capacity_ = read_consumer_integer("stream-frame-buffer", realtime_ ? 1 : 64, 1, 256);
+        packet_buffer_capacity_ = read_consumer_integer("stream-packet-buffer", realtime_ ? 1 : 128, 1, 256);
+        queue_diagnostics_ = read_consumer_integer("stream-queue-diagnostics", 0, 0, 1) != 0;
         frame_buffer_.set_capacity(frame_buffer_capacity_);
 
         diagnostics::register_graph(graph_);
