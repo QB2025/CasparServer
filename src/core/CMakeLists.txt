@@ -63,6 +63,7 @@ set(HEADERS
 		producer/transition/transition_producer.h
 		producer/transition/sting_producer.h
 		producer/route/route_producer.h
+		producer/route/fix_stream_tag.h
 
 		producer/cg_proxy.h
 		producer/frame_producer.h
