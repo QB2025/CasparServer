@@ -42,6 +42,35 @@ if(NOT SFML_FOUND)
     find_package(SFML 2 COMPONENTS graphics system window REQUIRED)
 endif()
 
+set(AJANTV2_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_DEMOS ON CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_DRIVER ON CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_TESTS ON CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_TOOLS ON CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_PLUGIN_LOAD ON CACHE BOOL "" FORCE)
+
+set(AJA_INSTALL_SOURCES OFF CACHE BOOL "" FORCE)
+set(AJA_INSTALL_HEADERS OFF CACHE BOOL "" FORCE)
+set(AJA_INSTALL_LIBS OFF CACHE BOOL "" FORCE)
+set(AJA_INSTALL_CMAKE OFF CACHE BOOL "" FORCE)
+set(AJA_INSTALL_MISC OFF CACHE BOOL "" FORCE)
+
+FetchContent_Declare(
+    libajantv2
+    GIT_REPOSITORY https://github.com/aja-video/libajantv2.git
+    GIT_TAG 4add45239a03960aa36de6fef326ee1b753e8ec9
+    GIT_SHALLOW FALSE
+
+    PATCH_COMMAND
+        ${CMAKE_COMMAND}
+            -DSOURCE_DIR=<SOURCE_DIR>
+            -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/libajantv2-remove-transfer-success-log.patch
+            -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+            -P ${CMAKE_CURRENT_LIST_DIR}/ApplyAjaPatch.cmake
+)
+
+FetchContent_MakeAvailable(libajantv2)
+
 IF (ENABLE_VULKAN)
     find_package(Vulkan REQUIRED)
 
@@ -76,12 +105,37 @@ if (ENABLE_HTML)
             "${CEF_LIB_PATH}/libcef_dll_wrapper.a"
         )
     else()
+        set(CEF_LOCAL_ROOT "" CACHE PATH "Path to an extracted CEF binary distribution")
+        if(CEF_LOCAL_ROOT)
+            get_filename_component(CEF_LOCAL_ROOT "${CEF_LOCAL_ROOT}" ABSOLUTE)
+            foreach(required
+                    include/cef_version.h
+                    libcef_dll/CMakeLists.txt
+                    Release/libcef.so
+                    Resources/resources.pak)
+                if(NOT EXISTS "${CEF_LOCAL_ROOT}/${required}")
+                    message(FATAL_ERROR "CEF_LOCAL_ROOT is missing ${required}: ${CEF_LOCAL_ROOT}")
+                endif()
+            endforeach()
+            set(CEF_SOURCE_OPTIONS
+                SOURCE_DIR "${CEF_LOCAL_ROOT}"
+                DOWNLOAD_COMMAND ""
+                UPDATE_COMMAND "")
+        else()
+            set(CEF_SOURCE_OPTIONS
+                URL https://cef-builds.spotifycdn.com/cef_binary_154.0.28%2Bg564dd6c%2Bchromium-154.0.8037.58_linux64_minimal.tar.bz2
+                URL_HASH SHA256=bbda02696d5e08f0844f131516a0bdfab301ab33e868bda14cbde93fe876cb03)
+        endif()
+
         casparcg_add_external_project(cef)
         ExternalProject_Add(cef
-            URL ${CASPARCG_DOWNLOAD_MIRROR}/cef/cef_binary_142.0.17+g60aac24+chromium-142.0.7444.176_linux64_minimal.tar.bz2
-            URL_HASH SHA256=1d89e19b2f446105f9a1fe6fdc96bced86249b5884241dcc4013b7c94dabf424
+            ${CEF_SOURCE_OPTIONS}
             DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
-            CMAKE_ARGS -DUSE_SANDBOX=Off
+            CMAKE_ARGS
+                -DUSE_SANDBOX=Off
+                -DCMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}
+                -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+                -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
             INSTALL_COMMAND ""
             BUILD_BYPRODUCTS
                 "<SOURCE_DIR>/Release/libcef.so"
@@ -108,8 +162,6 @@ if (ENABLE_HTML)
 
         install(FILES ${SOURCE_DIR}/Release/chrome-sandbox TYPE LIB)
         install(FILES ${SOURCE_DIR}/Release/libcef.so TYPE LIB)
-        install(FILES ${SOURCE_DIR}/Release/libEGL.so TYPE LIB)
-        install(FILES ${SOURCE_DIR}/Release/libGLESv2.so TYPE LIB)
         install(FILES ${SOURCE_DIR}/Release/libvk_swiftshader.so TYPE LIB)
         install(FILES ${SOURCE_DIR}/Release/libvulkan.so.1 TYPE LIB)
         install(FILES ${SOURCE_DIR}/Release/v8_context_snapshot.bin TYPE LIB)
