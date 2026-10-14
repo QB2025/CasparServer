@@ -20,6 +20,7 @@
  */
 
 #include "../StdAfx.h"
+#include <common/diagnostics/cadence.h>
 
 #include "stage.h"
 
@@ -45,6 +46,7 @@ namespace caspar { namespace core {
 
 struct stage::impl : public std::enable_shared_from_this<impl>
 {
+    caspar::diagnostics::cadence_metric stage_tick_{L"stage_tick"};
     int                                 channel_index_;
     spl::shared_ptr<diagnostics::graph> graph_;
     monitor::state                      state_;
@@ -127,6 +129,10 @@ struct stage::impl : public std::enable_shared_from_this<impl>
             result.format_desc = video_format_desc();
             result.nb_samples =
                 result.format_desc.audio_cadence[frame_number % result.format_desc.audio_cadence.size()];
+
+            caspar::diagnostics::cadence_scope stage_tick_scope(
+                stage_tick_, true, result.nb_samples * result.format_desc.field_count,
+                [&] { return L"channel=" + std::to_wstring(channel_index_) + L" format=" + result.format_desc.name + L" nb_samples=" + std::to_wstring(result.nb_samples); });
 
             auto is_interlaced = format_desc_.field_count == 2;
             auto field1        = is_interlaced ? video_field::a : video_field::progressive;
@@ -226,6 +232,7 @@ struct stage::impl : public std::enable_shared_from_this<impl>
                 CASPAR_LOG_CURRENT_EXCEPTION();
             }
 
+            stage_tick_scope.finish();
             return result;
         });
     }

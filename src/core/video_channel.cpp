@@ -20,6 +20,7 @@
  */
 
 #include "StdAfx.h"
+#include <common/diagnostics/cadence.h>
 
 #include "common/os/thread.h"
 #include "video_channel.h"
@@ -66,6 +67,11 @@ struct video_channel::impl final
     spl::shared_ptr<image_mixer> image_mixer_;
     caspar::core::mixer          mixer_;
     std::shared_ptr<core::stage> stage_;
+
+    caspar::diagnostics::cadence_metric channel_cycle_{L"channel_cycle"};
+    caspar::diagnostics::cadence_metric channel_produce_{L"channel_produce"};
+    caspar::diagnostics::cadence_metric channel_mix_{L"channel_mix"};
+    caspar::diagnostics::cadence_metric channel_consume_{L"channel_consume"};
 
     uint64_t frame_counter_ = 0;
 
@@ -127,6 +133,7 @@ struct video_channel::impl final
 
             while (!abort_request_) {
                 try {
+                    caspar::diagnostics::cadence_scope channel_cycle_scope(channel_cycle_, true, 0, [&] { return print(); });
                     graph_->set_text(print());
 
                     frame_counter_ += 1;
@@ -151,7 +158,12 @@ struct video_channel::impl final
 
                     // Produce
                     caspar::timer produce_timer;
-                    auto          stage_frames = (*stage_)(frame_counter_, background_routes, routesCb);
+                    auto stage_frames = [&] {
+                        caspar::diagnostics::cadence_scope channel_produce_scope(
+                            channel_produce_, true, 0,
+                            [&] { return print(); });
+                        return (*stage_)(frame_counter_, background_routes, routesCb);
+                    }();
                     graph_->set_value("produce-time", produce_timer.elapsed() * stage_frames.format_desc.hz * 0.5);
 
                     // This is a little race prone, but at worst a new consumer will start with a frame of black
@@ -159,6 +171,8 @@ struct video_channel::impl final
 
                     // Mix
                     caspar::timer mix_timer;
+                    const auto mix_begin = caspar::diagnostics::cadence_enabled()
+                        ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     auto          mixed_frame =
                         has_consumers ? mixer_(stage_frames.frames, stage_frames.format_desc, stage_frames.nb_samples)
                                                : const_frame{};
@@ -168,9 +182,17 @@ struct video_channel::impl final
                             : const_frame{};
                     graph_->set_value("mix-time", mix_timer.elapsed() * stage_frames.format_desc.hz * 0.5);
 
+                    if (caspar::diagnostics::cadence_enabled())
+                        channel_mix_.record(mix_begin, 0, [&] { return print(); });
+
                     // Consume
                     caspar::timer consume_timer;
-                    output_(mixed_frame, mixed_frame2, stage_frames.format_desc);
+                    {
+                        caspar::diagnostics::cadence_scope channel_consume_scope(
+                            channel_consume_, true, stage_frames.nb_samples * stage_frames.format_desc.field_count,
+                            [&] { return print(); });
+                        output_(mixed_frame, mixed_frame2, stage_frames.format_desc);
+                    }
                     graph_->set_value("consume-time", consume_timer.elapsed() * stage_frames.format_desc.hz * 0.5);
 
                     graph_->set_value("frame-time", frame_timer.elapsed() * stage_frames.format_desc.hz * 0.5);

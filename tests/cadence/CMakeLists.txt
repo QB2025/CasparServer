@@ -1,0 +1,17 @@
+cmake_minimum_required(VERSION 3.18)
+project(cadence_diagnostics_test LANGUAGES CXX)
+enable_testing()
+add_executable(cadence_test cadence_test.cpp)
+target_compile_features(cadence_test PRIVATE cxx_std_17)
+# Test the header without server/Boost logging dependencies. This shim is only
+# visible to this standalone test target, never to any server target.
+target_include_directories(cadence_test PRIVATE support ../../src)
+if(MSVC)
+    target_compile_options(cadence_test PRIVATE /UNDEBUG)
+else()
+    target_compile_options(cadence_test PRIVATE -UNDEBUG -Wall -Wextra -Werror)
+endif()
+add_test(NAME cadence_disabled COMMAND cadence_test)
+add_test(NAME cadence_enabled COMMAND cadence_test enabled)
+set_tests_properties(cadence_disabled PROPERTIES ENVIRONMENT "CASPAR_AJA_CADENCE_DIAGNOSTICS=0")
+set_tests_properties(cadence_enabled PROPERTIES ENVIRONMENT "CASPAR_AJA_CADENCE_DIAGNOSTICS=1")

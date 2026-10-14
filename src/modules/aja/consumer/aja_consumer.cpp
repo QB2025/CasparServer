@@ -1,4 +1,5 @@
 #include "aja_consumer.h"
+#include <common/diagnostics/cadence.h>
 
 #include <common/except.h>
 #include <common/future.h>
@@ -22,8 +23,8 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <deque>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -206,17 +207,17 @@ class aja_consumer final : public core::frame_consumer
     std::vector<uint8_t>      key_buffer_;
     std::vector<std::int32_t> audio_buffer_;
 
-    NTV2AudioSystem audio_system_       = NTV2_AUDIOSYSTEM_1;
+    NTV2AudioSystem audio_system_        = NTV2_AUDIOSYSTEM_1;
     ULWord          audio_channel_count_ = 0;
 
-    ULWord          device_index_ = 0;
+    ULWord          device_index_    = 0;
     NTV2Channel     channel_         = NTV2_CHANNEL1;
     NTV2Channel     key_channel_     = NTV2_CHANNEL_INVALID;
     NTV2Channel     playout_channel_ = NTV2_CHANNEL1;
     NTV2Channel     pacing_channel_  = NTV2_CHANNEL1;
     NTV2VideoFormat video_format_    = NTV2_FORMAT_UNKNOWN;
 
-    bool key_enabled_                  = false;
+    bool key_enabled_                 = false;
     bool legacy_external_key_routing_ = false;
 
     bool   initialized_                = false;
@@ -246,10 +247,10 @@ class aja_consumer final : public core::frame_consumer
     static constexpr std::size_t kInputQueueCapacity    = 2;
     static constexpr std::size_t kPreparedQueueCapacity = 2;
 
-    std::deque<queued_output_frame>   input_queue_;
-    std::mutex                        input_queue_mutex_;
-    std::condition_variable           input_queue_not_empty_;
-    std::condition_variable           input_queue_not_full_;
+    std::deque<queued_output_frame> input_queue_;
+    std::mutex                      input_queue_mutex_;
+    std::condition_variable         input_queue_not_empty_;
+    std::condition_variable         input_queue_not_full_;
 
     std::deque<std::unique_ptr<prepared_output_frame>> prepared_queue_;
     std::deque<std::unique_ptr<prepared_output_frame>> prepared_free_slots_;
@@ -258,12 +259,11 @@ class aja_consumer final : public core::frame_consumer
     std::condition_variable                            prepared_queue_not_full_;
     std::condition_variable                            prepared_slot_available_;
 
-    std::thread conversion_thread_;
-    std::thread output_thread_;
+    std::thread      conversion_thread_;
+    std::thread      output_thread_;
     std::atomic_bool pipeline_stop_requested_{false};
 
-    std::atomic_bool           output_worker_failed_{false};
-
+    std::atomic_bool output_worker_failed_{false};
 
   public:
     aja_consumer(ULWord device_index, NTV2Channel channel, NTV2Channel key_channel = NTV2_CHANNEL_INVALID)
@@ -352,11 +352,9 @@ class aja_consumer final : public core::frame_consumer
         // external fill/key can be produced from FrameStore 2 through CSC1.
         // Keep the configured channel/key-channel as the physical SDI pair and
         // select the internal playout FrameStore independently.
-        legacy_external_key_routing_ =
-            key_enabled_ && !is_uhd &&
-            device_.features().GetNumFrameStores() == 2 &&
-            device_.features().GetNumCSCs() == 1 &&
-            channel_ == NTV2_CHANNEL1 && key_channel_ == NTV2_CHANNEL2;
+        legacy_external_key_routing_ = key_enabled_ && !is_uhd && device_.features().GetNumFrameStores() == 2 &&
+                                       device_.features().GetNumCSCs() == 1 && channel_ == NTV2_CHANNEL1 &&
+                                       key_channel_ == NTV2_CHANNEL2;
 
         playout_channel_ = legacy_external_key_routing_ ? NTV2_CHANNEL2 : channel_;
         pacing_channel_  = legacy_external_key_routing_ ? NTV2_CHANNEL1 : playout_channel_;
@@ -419,6 +417,11 @@ class aja_consumer final : public core::frame_consumer
             }
         }
 
+        if (device_.features().CanDoMultiFormat()) {
+            if (!device_.SetMultiFormatMode(true))
+                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to enable AJA multi-format mode"));
+        }
+
         if (is_uhd) {
             //
             // UHD TSI on the original Corvid44 uses two FrameStores.
@@ -454,7 +457,8 @@ class aja_consumer final : public core::frame_consumer
             device_.SetVANCShiftMode(playout_channel_, NTV2_VANCDATA_NORMAL);
 
             if (!device_.SetVideoFormat(video_format_, false, false, playout_channel_)) {
-                CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set selected AJA playout video format"));
+                CASPAR_THROW_EXCEPTION(caspar_exception()
+                                       << msg_info("Unable to set selected AJA playout video format"));
             }
 
             const NTV2FrameBufferFormat playout_pixel_format =
@@ -595,13 +599,11 @@ class aja_consumer final : public core::frame_consumer
         // This is particularly important on legacy two-FrameStore devices where
         // output may use FrameStore 2 while FrameStore 1 is active for capture.
         if (!device_.EnableOutputInterrupt(pacing_channel_)) {
-            CASPAR_THROW_EXCEPTION(caspar_exception()
-                                   << msg_info("Unable to enable AJA output vertical interrupt"));
+            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to enable AJA output vertical interrupt"));
         }
 
         if (!device_.SubscribeOutputVerticalEvent(pacing_channel_)) {
-            CASPAR_THROW_EXCEPTION(caspar_exception()
-                                   << msg_info("Unable to subscribe to AJA output vertical event"));
+            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to subscribe to AJA output vertical event"));
         }
 
         // Do not issue AutoCirculateStop + WaitForOutputVerticalInterrupt here.
@@ -677,10 +679,10 @@ class aja_consumer final : public core::frame_consumer
                          << L", AJA audio system configured";
     }
 
-    bool prepare_output_frame(core::video_field field,
-                              core::const_frame frame,
+    bool prepare_output_frame(core::video_field      field,
+                              core::const_frame      frame,
                               prepared_output_frame& prepared,
-                              bool& frame_ready)
+                              bool&                  frame_ready)
     {
         frame_ready = false;
 
@@ -696,7 +698,7 @@ class aja_consumer final : public core::frame_consumer
                 return false;
             }
 
-            const auto& image = frame.image_data(0);
+            const auto&       image = frame.image_data(0);
             const std::size_t expected =
                 static_cast<std::size_t>(format_desc_.width) * static_cast<std::size_t>(format_desc_.height) * 4u;
 
@@ -706,8 +708,8 @@ class aja_consumer final : public core::frame_consumer
                 return false;
             }
 
-            const bool interlaced = format_desc_.field_count == 2;
-            const auto& audio = frame.audio_data();
+            const bool  interlaced = format_desc_.field_count == 2;
+            const auto& audio      = frame.audio_data();
 
             if (interlaced) {
                 const int first_line = field == core::video_field::a ? 0 : 1;
@@ -744,22 +746,17 @@ class aja_consumer final : public core::frame_consumer
                 if (key_enabled_ && !legacy_external_key_routing_)
                     prepared.key = key_buffer_;
                 constexpr std::size_t caspar_audio_channels = 16;
-                const std::size_t aja_audio_channels =
-                    static_cast<std::size_t>(audio_channel_count_);
+                const std::size_t     aja_audio_channels    = static_cast<std::size_t>(audio_channel_count_);
 
-                if (aja_audio_channels > 0 &&
-                    aja_audio_channels < caspar_audio_channels &&
+                if (aja_audio_channels > 0 && aja_audio_channels < caspar_audio_channels &&
                     audio_buffer_.size() % caspar_audio_channels == 0) {
-                    const std::size_t sample_frames =
-                        audio_buffer_.size() / caspar_audio_channels;
+                    const std::size_t sample_frames = audio_buffer_.size() / caspar_audio_channels;
 
                     prepared.audio.resize(sample_frames * aja_audio_channels);
 
                     for (std::size_t sample = 0; sample < sample_frames; ++sample) {
-                        const auto* src =
-                            audio_buffer_.data() + sample * caspar_audio_channels;
-                        auto* dst =
-                            prepared.audio.data() + sample * aja_audio_channels;
+                        const auto* src = audio_buffer_.data() + sample * caspar_audio_channels;
+                        auto*       dst = prepared.audio.data() + sample * aja_audio_channels;
 
                         std::copy_n(src, aja_audio_channels, dst);
                     }
@@ -771,9 +768,9 @@ class aja_consumer final : public core::frame_consumer
                 return true;
             }
 
-            const std::size_t raster_bytes =
-                static_cast<std::size_t>(format_desc_.width) * static_cast<std::size_t>(format_desc_.height) *
-                (legacy_external_key_routing_ ? 4u : 2u);
+            const std::size_t raster_bytes = static_cast<std::size_t>(format_desc_.width) *
+                                             static_cast<std::size_t>(format_desc_.height) *
+                                             (legacy_external_key_routing_ ? 4u : 2u);
             if (prepared.video.size() != raster_bytes)
                 prepared.video.resize(raster_bytes);
 
@@ -798,15 +795,20 @@ class aja_consumer final : public core::frame_consumer
         }
     }
 
-    bool transfer_prepared_frame(prepared_output_frame& prepared)
+    caspar::diagnostics::cadence_metric aja_send_queue_wait_{L"aja_send_queue_wait"};
+    caspar::diagnostics::cadence_metric aja_worker_transfer_{L"aja_worker_transfer"};
+    caspar::diagnostics::cadence_metric aja_vertical_wait_{L"aja_vertical_wait"};
+    caspar::diagnostics::cadence_metric aja_output_transfer_{L"aja_output_transfer"};
+    caspar::diagnostics::cadence_metric aja_prepare_{L"aja_prepare"};
+    bool                                transfer_prepared_frame(prepared_output_frame& prepared)
     {
         try {
             AUTOCIRCULATE_STATUS status;
             if (!device_.AutoCirculateGetStatus(playout_channel_, status))
                 return false;
 
-            constexpr ULWord kAcTargetFill = 5;
-            auto ac_may_accept_for_target_fill = [&](const AUTOCIRCULATE_STATUS& s) {
+            constexpr ULWord kAcTargetFill                 = 5;
+            auto             ac_may_accept_for_target_fill = [&](const AUTOCIRCULATE_STATUS& s) {
                 const ULWord level     = s.GetBufferLevel();
                 const ULWord available = s.GetNumAvailableOutputFrames();
 
@@ -817,7 +819,11 @@ class aja_consumer final : public core::frame_consumer
             };
 
             while (!ac_may_accept_for_target_fill(status)) {
-                device_.WaitForOutputVerticalInterrupt(pacing_channel_);
+                {
+                    caspar::diagnostics::cadence_scope aja_vertical_wait_scope(
+                        aja_vertical_wait_, auto_circulate_started_, 0, [&] { return print(); });
+                    device_.WaitForOutputVerticalInterrupt(pacing_channel_);
+                }
                 if (!device_.AutoCirculateGetStatus(playout_channel_, status))
                     return false;
             }
@@ -843,6 +849,9 @@ class aja_consumer final : public core::frame_consumer
                 transfer.acDesiredFrame = next_fill_frame_;
             }
 
+            const auto transfer_begin = caspar::diagnostics::cadence_enabled()
+                                            ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
             if (!device_.AutoCirculateTransfer(playout_channel_, transfer)) {
                 CASPAR_LOG(error) << L"AJA AutoCirculateTransfer failed";
                 return false;
@@ -855,6 +864,23 @@ class aja_consumer final : public core::frame_consumer
                     ++next_fill_frame_;
             }
 
+            if (caspar::diagnostics::cadence_enabled() && auto_circulate_started_)
+                aja_output_transfer_.record(transfer_begin, 0, [&] {
+                    NTV2VideoFormat     actual    = NTV2_FORMAT_UNKNOWN;
+                    const bool          mode_ok   = device_.GetVideoFormat(actual, playout_channel_);
+                    const auto          reference = device_.GetReferenceVideoFormat();
+                    NTV2ReferenceSource selected_reference{};
+                    const bool          reference_ok = device_.GetReference(selected_reference);
+                    return print() + L" mode_read_ok=" + std::to_wstring(mode_ok) + L" configured_mode=" +
+                           std::to_wstring(static_cast<int>(video_format_)) + L" actual_mode=" +
+                           std::to_wstring(static_cast<int>(actual)) + L" reference_read_ok=" +
+                           std::to_wstring(reference_ok) + L" selected_reference=" +
+                           std::to_wstring(static_cast<int>(selected_reference)) + L" ac_processed_total=" +
+                           std::to_wstring(status.GetProcessedFrameCount()) + L" ac_dropped_total=" +
+                           std::to_wstring(status.GetDroppedFrameCount()) + L" ac_buffer_level=" +
+                           std::to_wstring(status.GetBufferLevel()) + L" reference_signal_mode=" +
+                           std::to_wstring(static_cast<int>(reference));
+                });
             ++successful_frame_transfers_;
 
             if (!auto_circulate_started_ && successful_frame_transfers_ >= 5) {
@@ -878,20 +904,28 @@ class aja_consumer final : public core::frame_consumer
         if (!initialized_ || !frame || output_worker_failed_.load())
             return caspar::make_ready_future(false);
 
-        std::unique_lock<std::mutex> lock(input_queue_mutex_);
+        std::size_t input_depth = 0;
+        {
+            caspar::diagnostics::cadence_scope aja_send_queue_wait_scope(aja_send_queue_wait_, true, 0, [&] {
+                return print() + L" input_queue_after_push=" + std::to_wstring(input_depth);
+            });
+            std::unique_lock<std::mutex>       lock(input_queue_mutex_);
 
-        input_queue_not_full_.wait(lock, [this] {
-            return pipeline_stop_requested_ || output_worker_failed_.load() ||
-                   input_queue_.size() < kInputQueueCapacity;
-        });
+            input_queue_not_full_.wait(lock, [this] {
+                return pipeline_stop_requested_ || output_worker_failed_.load() ||
+                       input_queue_.size() < kInputQueueCapacity;
+            });
 
-        if (pipeline_stop_requested_ || output_worker_failed_.load())
-            return caspar::make_ready_future(false);
+            if (pipeline_stop_requested_ || output_worker_failed_.load())
+                return caspar::make_ready_future(false);
 
-        input_queue_.push_back(queued_output_frame{field, std::move(frame)});
+            input_queue_.push_back(queued_output_frame{field, std::move(frame)});
+            if (caspar::diagnostics::cadence_enabled())
+                input_depth = input_queue_.size();
 
-        lock.unlock();
-        input_queue_not_empty_.notify_one();
+            lock.unlock();
+            input_queue_not_empty_.notify_one();
+        }
         return caspar::make_ready_future(true);
     }
 
@@ -907,9 +941,9 @@ class aja_consumer final : public core::frame_consumer
             prepared_queue_.clear();
             prepared_free_slots_.clear();
 
-            const std::size_t raster_bytes =
-                static_cast<std::size_t>(format_desc_.width) * static_cast<std::size_t>(format_desc_.height) *
-                (legacy_external_key_routing_ ? 4u : 2u);
+            const std::size_t raster_bytes = static_cast<std::size_t>(format_desc_.width) *
+                                             static_cast<std::size_t>(format_desc_.height) *
+                                             (legacy_external_key_routing_ ? 4u : 2u);
 
             for (std::size_t i = 0; i < kPreparedQueueCapacity + 2; ++i) {
                 auto slot = std::make_unique<prepared_output_frame>();
@@ -986,9 +1020,7 @@ class aja_consumer final : public core::frame_consumer
 
             {
                 std::unique_lock<std::mutex> lock(input_queue_mutex_);
-                input_queue_not_empty_.wait(lock, [this] {
-                    return pipeline_stop_requested_ || !input_queue_.empty();
-                });
+                input_queue_not_empty_.wait(lock, [this] { return pipeline_stop_requested_ || !input_queue_.empty(); });
 
                 if (pipeline_stop_requested_ && input_queue_.empty())
                     break;
@@ -1001,9 +1033,8 @@ class aja_consumer final : public core::frame_consumer
             std::unique_ptr<prepared_output_frame> prepared;
             {
                 std::unique_lock<std::mutex> lock(prepared_queue_mutex_);
-                prepared_slot_available_.wait(lock, [this] {
-                    return pipeline_stop_requested_ || !prepared_free_slots_.empty();
-                });
+                prepared_slot_available_.wait(
+                    lock, [this] { return pipeline_stop_requested_ || !prepared_free_slots_.empty(); });
 
                 if (pipeline_stop_requested_)
                     break;
@@ -1013,7 +1044,12 @@ class aja_consumer final : public core::frame_consumer
             }
 
             bool frame_ready = false;
-            if (!prepare_output_frame(queued.field, std::move(queued.frame), *prepared, frame_ready)) {
+            bool prepare_ok;
+            {
+                caspar::diagnostics::cadence_scope prepare_scope(aja_prepare_, true, 0, [&] { return print(); });
+                prepare_ok = prepare_output_frame(queued.field, std::move(queued.frame), *prepared, frame_ready);
+            }
+            if (!prepare_ok) {
                 fail_output_pipeline(L"conversion");
                 break;
             }
@@ -1026,9 +1062,8 @@ class aja_consumer final : public core::frame_consumer
             }
 
             std::unique_lock<std::mutex> lock(prepared_queue_mutex_);
-            prepared_queue_not_full_.wait(lock, [this] {
-                return pipeline_stop_requested_ || prepared_queue_.size() < kPreparedQueueCapacity;
-            });
+            prepared_queue_not_full_.wait(
+                lock, [this] { return pipeline_stop_requested_ || prepared_queue_.size() < kPreparedQueueCapacity; });
 
             if (pipeline_stop_requested_)
                 break;
@@ -1044,21 +1079,31 @@ class aja_consumer final : public core::frame_consumer
     {
         for (;;) {
             std::unique_ptr<prepared_output_frame> prepared;
+            std::size_t                            prepared_depth = 0;
             {
                 std::unique_lock<std::mutex> lock(prepared_queue_mutex_);
-                prepared_queue_not_empty_.wait(lock, [this] {
-                    return pipeline_stop_requested_ || !prepared_queue_.empty();
-                });
+                prepared_queue_not_empty_.wait(lock,
+                                               [this] { return pipeline_stop_requested_ || !prepared_queue_.empty(); });
 
                 if (pipeline_stop_requested_ && prepared_queue_.empty())
                     break;
 
                 prepared = std::move(prepared_queue_.front());
                 prepared_queue_.pop_front();
+                if (caspar::diagnostics::cadence_enabled())
+                    prepared_depth = prepared_queue_.size();
             }
             prepared_queue_not_full_.notify_one();
 
-            if (!transfer_prepared_frame(*prepared)) {
+            bool transferred;
+            {
+                caspar::diagnostics::cadence_scope aja_worker_transfer_scope(
+                    aja_worker_transfer_, auto_circulate_started_, 0, [&] {
+                        return print() + L" prepared_queue_after_pop=" + std::to_wstring(prepared_depth);
+                    });
+                transferred = transfer_prepared_frame(*prepared);
+            }
+            if (!transferred) {
                 fail_output_pipeline(L"AJA transfer");
                 break;
             }

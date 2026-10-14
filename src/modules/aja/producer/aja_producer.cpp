@@ -1,4 +1,5 @@
 #include "aja_producer.h"
+#include <common/diagnostics/cadence.h>
 
 #include <common/except.h>
 #include <common/log.h>
@@ -36,11 +37,14 @@ extern "C" {
 #include <map>
 #include <memory>
 #include <mutex>
+
+#include <sstream>
+
 #include <string>
-#include <utility>
-#include <thread>
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_invoke.h>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace caspar { namespace aja {
@@ -57,7 +61,7 @@ constexpr ULWord                kCasparAudioChannels = 16;
 // cannot stop or disable hardware already taken over by its replacement.
 using capture_owner_key = std::pair<ULWord, int>;
 
-std::mutex                                  g_capture_owner_mutex;
+std::mutex                                 g_capture_owner_mutex;
 std::map<capture_owner_key, std::uint64_t> g_capture_owners;
 std::atomic<std::uint64_t>                 g_next_capture_owner_token{1};
 
@@ -116,8 +120,8 @@ class aja_producer final : public core::frame_producer
     NTV2Channel channel_      = NTV2_CHANNEL1;
 
     CNTV2Card       device_;
-    NTV2InputSource input_source_ = NTV2_INPUTSOURCE_INVALID;
-    NTV2VideoFormat input_format_ = NTV2_FORMAT_UNKNOWN;
+    NTV2InputSource input_source_       = NTV2_INPUTSOURCE_INVALID;
+    NTV2VideoFormat input_format_       = NTV2_FORMAT_UNKNOWN;
     NTV2AudioSystem audio_system_       = NTV2_AUDIOSYSTEM_1;
     ULWord          aja_audio_channels_ = 0;
 
@@ -143,17 +147,16 @@ class aja_producer final : public core::frame_producer
         std::uint64_t             sequence   = 0;
     };
 
-    static constexpr std::size_t kRawQueueCapacity            = 4;
-    static constexpr std::size_t kCaptureQueueCapacity        = 4;
+    static constexpr std::size_t kRawQueueCapacity             = 4;
+    static constexpr std::size_t kCaptureQueueCapacity         = 4;
     static constexpr std::size_t kCaptureQueueStartupPrebuffer = 3;
-    static constexpr std::size_t kCaptureQueueRebuffer         = 2;
 
     mutable std::mutex             raw_mutex_;
     std::deque<raw_captured_frame> raw_queue_;
 
     mutable std::mutex         frame_mutex_;
     std::deque<captured_frame> capture_queue_;
-    bool                       capture_queue_primed_ = false;
+    bool                       capture_queue_primed_       = false;
     std::size_t                capture_queue_prime_target_ = kCaptureQueueStartupPrebuffer;
 
     mutable std::mutex exception_mutex_;
@@ -167,68 +170,82 @@ class aja_producer final : public core::frame_producer
 
     bool auto_circulate_started_ = false;
 
-    const std::uint64_t capture_owner_token_ =
-        g_next_capture_owner_token.fetch_add(1, std::memory_order_relaxed);
-    std::uint64_t previous_capture_owner_token_ = 0;
-    bool          capture_ownership_claimed_     = false;
+    const std::uint64_t capture_owner_token_ = g_next_capture_owner_token.fetch_add(1, std::memory_order_relaxed);
+    std::uint64_t       previous_capture_owner_token_ = 0;
+    bool                capture_ownership_claimed_    = false;
 
-    std::chrono::steady_clock::time_point last_no_frame_signal_check_ =
-        std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point last_no_frame_signal_check_ = std::chrono::steady_clock::now();
 
     static constexpr unsigned kCleanFramesAfterReacquire = 3;
     bool                      signal_was_good_           = true;
     unsigned                  clean_reacquire_frames_    = kCleanFramesAfterReacquire;
 
-
     core::draw_frame latched_frame_a_;
-    core::draw_frame latched_frame_b_;
-    bool             deliver_b_audio_  = false;
-    bool             interlaced_second_half_ = false;
-    std::atomic_bool interlaced_phase_reset_requested_{false};
-    std::uint64_t    last_latched_generation_ = 0;
-    std::uint64_t    last_latched_sequence_   = 0;
 
-    // Progressive clock-domain adapter. AJA capture and the Caspar channel
+    // Shared progressive/interlaced clock-domain adapter. AJA capture and the Caspar channel
     // run from independent clocks even when both nominally use the same
     // frame rate. Keep video selection and audio delivery independent:
     // video may repeat/skip, while audio is consumed as a continuous 48 kHz
     // stream according to Caspar's requested nb_samples cadence.
-    std::vector<std::uint8_t> progressive_video_uyvy_;
-    std::vector<std::int32_t> progressive_audio_;
-    std::size_t               progressive_audio_offset_ = 0;
+    std::vector<std::uint8_t> clock_adapter_video_uyvy_;
+    std::vector<std::int32_t> clock_adapter_audio_;
+    std::size_t               clock_adapter_audio_offset_ = 0;
 
-    // Progressive audio clock-domain servo.  The SDI input and Caspar/output
+    // Shared audio clock-domain servo.  The SDI input and Caspar/output
     // clocks are independent, so maintain an operating region rather than only
     // priming once and then allowing the reservoir to wander toward zero.
-    static constexpr std::size_t kProgressiveAudioTargetFrames   = 3200;
-    static constexpr std::size_t kProgressiveAudioDeadbandFrames = 200;
-    static constexpr std::size_t kProgressiveAudioLowFrames =
-        kProgressiveAudioTargetFrames - kProgressiveAudioDeadbandFrames;
-    static constexpr std::size_t kProgressiveAudioHighFrames =
-        kProgressiveAudioTargetFrames + kProgressiveAudioDeadbandFrames;
+    static constexpr std::size_t kAudioTargetFrames   = 3200;
+    static constexpr std::size_t kAudioDeadbandFrames = 200;
+    static constexpr std::size_t kAudioLowFrames =
+        kAudioTargetFrames - kAudioDeadbandFrames;
+    static constexpr std::size_t kAudioHighFrames =
+        kAudioTargetFrames + kAudioDeadbandFrames;
 
-    bool progressive_audio_started_ = false;
+    bool clock_adapter_audio_started_ = false;
 
-    // V4.7: keep V4.3's external captured-audio reservoir as the shock
-    // absorber.  SWR is only a slow fractional actuator.  A filtered view of
+    // Keep the external captured-audio reservoir as the shock absorber.  SWR is only a slow fractional actuator.  A filtered view of
     // the EXTERNAL reservoir estimates long-term clock drift; callback-scale
     // jitter must not steer the resampler.
-    SwrContext* progressive_audio_swr_ = nullptr;
-    static constexpr int    kProgressiveAudioRate = 48000;
-    static constexpr int    kProgressiveAudioCompensationDistance = 48000; // 1 second
-    static constexpr int    kProgressiveAudioMaxCorrectionPpm = 1000;
-    static constexpr double kProgressiveAudioFilterAlpha = 0.03; // ~0.55 s at 60 callbacks/s
-    static constexpr std::size_t kProgressiveAudioSWRPrimeFrames = 64;
-    bool   progressive_audio_filter_initialized_ = false;
-    double progressive_audio_filtered_depth_ = static_cast<double>(kProgressiveAudioTargetFrames);
-    bool   progressive_audio_swr_primed_ = false;
-    double progressive_audio_input_phase_ = 0.0;
-    int    progressive_audio_correction_ppm_ = 0;
-    int    progressive_audio_compensation_delta_ = 0;
+    SwrContext*                  clock_adapter_audio_swr_                = nullptr;
+    static constexpr int         kAudioRate                 = 48000;
+    static constexpr int         kAudioCompensationDistance = 48000; // 1 second
+    static constexpr int         kAudioMaxCorrectionPpm     = 1000;
+    static constexpr double      kAudioFilterAlpha          = 0.03; // ~0.55 s at 60 callbacks/s
+    static constexpr std::size_t kAudioSWRPrimeFrames       = 64;
+    bool                         clock_adapter_audio_filter_initialized_ = false;
+    double                       clock_adapter_audio_filtered_depth_ = static_cast<double>(kAudioTargetFrames);
+    bool                         clock_adapter_audio_swr_primed_     = false;
+    double                       clock_adapter_audio_input_phase_    = 0.0;
+    int                          clock_adapter_audio_correction_ppm_ = 0;
+    int                          clock_adapter_audio_compensation_delta_ = 0;
 
-    std::uint64_t             progressive_generation_   = 0;
-    std::uint64_t             progressive_sequence_     = 0;
-    std::atomic_bool          progressive_reset_requested_{false};
+    std::uint64_t    clock_adapter_generation_ = 0;
+    std::uint64_t    clock_adapter_sequence_   = 0;
+    std::atomic_bool clock_adapter_reset_requested_{false};
+
+    // Diagnostics only. Cross-thread counters use relaxed atomics; none feed
+    // queue selection, audio budgets, compensation or recovery decisions.
+    std::atomic<std::uint64_t>            diag_captured_{0};
+    std::atomic<std::uint64_t>            diag_raw_dropped_{0}, diag_raw_audio_dropped_{0};
+    std::atomic<std::uint64_t>            diag_packaged_dropped_{0}, diag_packaged_audio_dropped_{0};
+    std::atomic<std::uint64_t>            diag_swr_input_{0}, diag_swr_output_{0};
+    std::atomic<std::uint64_t>            diag_underflows_{0}, diag_missing_output_{0};
+    std::mutex                            diag_reservoir_mutex_;
+    std::size_t                           diag_reservoir_min_ = static_cast<std::size_t>(-1);
+    std::size_t                           diag_reservoir_max_ = 0, diag_reservoir_observations_ = 0;
+    std::chrono::steady_clock::time_point diag_last_report_ = std::chrono::steady_clock::now();
+
+    struct callback_diagnostic_counts
+    {
+        std::uint64_t                calls = 0, positive_samples = 0, zero_calls = 0, negative_calls = 0;
+        int                          request_min = 0, request_max = 0;
+        std::map<int, std::uint64_t> requests;
+        std::map<std::wstring, std::pair<std::uint64_t, std::uint64_t>> returns;
+        std::uint64_t gaps = 0, gap_sum_us = 0, gap_min_us = 0, gap_max_us = 0;
+    };
+    std::mutex                            diag_callback_mutex_;
+    callback_diagnostic_counts            diag_impl_callbacks_, diag_clock_adapter_callbacks_;
+    std::chrono::steady_clock::time_point diag_impl_previous_{}, diag_clock_adapter_previous_{};
 
     core::monitor::state state_;
 
@@ -262,7 +279,7 @@ class aja_producer final : public core::frame_producer
 
         try {
             packaging_thread_ = std::thread([this] { packaging_loop(); });
-            capture_thread_    = std::thread([this] { capture_loop(); });
+            capture_thread_   = std::thread([this] { capture_loop(); });
         } catch (...) {
             stop_requested_ = true;
             if (capture_thread_.joinable())
@@ -291,70 +308,37 @@ class aja_producer final : public core::frame_producer
         // Replacement: ownership has moved, so leave the new producer alone.
         release_capture_hardware_if_owner();
 
-        if (progressive_audio_swr_)
-            swr_free(&progressive_audio_swr_);
+        if (clock_adapter_audio_swr_)
+            swr_free(&clock_adapter_audio_swr_);
 
         CASPAR_LOG(info) << print() << L" Uninitialized";
     }
 
-    core::draw_frame receive_impl(const core::video_field field, int nb_samples) override
+    caspar::diagnostics::cadence_metric aja_receive_{L"aja_receive"};
+    caspar::diagnostics::cadence_metric aja_make_frame_{L"aja_make_frame"};
+    core::draw_frame                    receive_impl(const core::video_field field, int nb_samples) override
     {
+        diagnostic_callback_entry(false, nb_samples);
+
         rethrow_capture_exception();
 
-        if (input_format_desc_.field_count == 2) {
-            if (interlaced_phase_reset_requested_.exchange(false)) {
-                interlaced_second_half_ = false;
-                deliver_b_audio_        = false;
-            }
-
-            // Caspar currently reaches this producer with video_field == 0 for
-            // every 1080i callback, so field cannot be used to select A/B.
-            // Drive the two-half delivery explicitly:
-            //   first callback  -> pop one complete 25 Hz capture, return A
-            //   second callback -> reuse that capture, return B
-            //
-            // Startup/probe calls use nb_samples == 0. They must not consume
-            // FIFO entries or advance the A/B phase.
-            if (nb_samples <= 0)
-                return latched_frame_a_ ? core::draw_frame::still(latched_frame_a_)
-                                        : core::draw_frame::empty();
-
-            if (!interlaced_second_half_ || !latched_frame_a_) {
-                const bool new_pair = latch_latest_pair(nb_samples);
-                deliver_b_audio_    = new_pair;
-
-                if (!new_pair) {
-                    interlaced_second_half_ = false;
-                    return latched_frame_a_ ? core::draw_frame::still(latched_frame_a_)
-                                            : core::draw_frame::empty();
-                }
-
-                interlaced_second_half_ = true;
-                return latched_frame_a_;
-            }
-
-            const bool with_audio = deliver_b_audio_;
-            deliver_b_audio_      = false;
-            interlaced_second_half_ = false;
-
-            return latched_frame_b_ ? (with_audio ? latched_frame_b_ : core::draw_frame::still(latched_frame_b_))
-                                    : core::draw_frame::empty();
-        }
-
-        // Progressive inputs cross an asynchronous clock boundary here.
+        // Both progressive and interlaced inputs cross an asynchronous clock boundary here.
         // Do not require one physical AJA frame for every Caspar callback.
         // Drain whatever capture has arrived, select the newest video frame,
         // and consume exactly nb_samples from a continuous audio reservoir.
-        return receive_progressive(nb_samples);
+        const bool measure = nb_samples > 0 && clock_adapter_audio_started_ && !clock_adapter_reset_requested_.load();
+        caspar::diagnostics::cadence_scope aja_receive_scope(aja_receive_, measure, nb_samples, [&] {
+            return print() + L" channel_format=" + channel_format_desc_.name + L" nb_samples=" +
+                   std::to_wstring(nb_samples) + L" reservoir_sample_frames=" +
+                   std::to_wstring((clock_adapter_audio_.size() - clock_adapter_audio_offset_) / kCasparAudioChannels);
+        });
+        return receive_clock_adapted(nb_samples);
     }
 
     core::draw_frame first_frame(const core::video_field field) override { return receive_impl(field, 0); }
 
     core::draw_frame last_frame(const core::video_field field) override
     {
-        if (!latched_frame_a_)
-            latch_latest_pair(0);
-
         return latched_frame_a_ ? core::draw_frame::still(latched_frame_a_) : core::draw_frame::empty();
     }
 
@@ -376,19 +360,103 @@ class aja_producer final : public core::frame_producer
     core::monitor::state state() const override { return state_; }
 
   private:
-    capture_owner_key capture_owner_key_value() const
+
+    void diagnostic_callback_entry(bool adapter, int samples)
     {
-        return {device_index_, static_cast<int>(channel_)};
+        if (!caspar::diagnostics::cadence_enabled())
+            return;
+
+        std::lock_guard<std::mutex> lock(diag_callback_mutex_);
+        const auto                  now      = std::chrono::steady_clock::now();
+        auto&                       counts   = adapter ? diag_clock_adapter_callbacks_ : diag_impl_callbacks_;
+        auto&                       previous = adapter ? diag_clock_adapter_previous_ : diag_impl_previous_;
+        if (counts.calls == 0)
+            counts.request_min = counts.request_max = samples;
+        counts.request_min = std::min(counts.request_min, samples);
+        counts.request_max = std::max(counts.request_max, samples);
+        ++counts.calls;
+        ++counts.requests[samples];
+        if (samples > 0)
+            counts.positive_samples += static_cast<std::uint64_t>(samples);
+        else if (samples == 0)
+            ++counts.zero_calls;
+        else
+            ++counts.negative_calls;
+        if (previous != std::chrono::steady_clock::time_point{}) {
+            const auto gap = static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(now - previous).count());
+            if (counts.gaps == 0)
+                counts.gap_min_us = counts.gap_max_us = gap;
+            counts.gap_min_us = std::min(counts.gap_min_us, gap);
+            counts.gap_max_us = std::max(counts.gap_max_us, gap);
+            ++counts.gaps;
+            counts.gap_sum_us += gap;
+        }
+        previous = now;
     }
+
+    void diagnostic_callback_return(bool adapter, const wchar_t* path, int samples)
+    {
+        if (!caspar::diagnostics::cadence_enabled())
+            return;
+
+        std::lock_guard<std::mutex> lock(diag_callback_mutex_);
+        auto                        record = [path, samples](callback_diagnostic_counts& counts) {
+            auto& value = counts.returns[path];
+            ++value.first;
+            if (samples > 0)
+                value.second += static_cast<std::uint64_t>(samples);
+        };
+        record(diag_impl_callbacks_);
+        // receive_clock_adapted is called exclusively by receive_impl; its return
+        // is also the enclosing receive_impl return. Do not count entries twice.
+        if (adapter)
+            record(diag_clock_adapter_callbacks_);
+    }
+
+    void report_callback_diagnostics(std::int64_t elapsed_ms)
+    {
+        if (!caspar::diagnostics::cadence_enabled())
+            return;
+
+        callback_diagnostic_counts impl, adapter;
+        {
+            std::lock_guard<std::mutex> lock(diag_callback_mutex_);
+            std::swap(impl, diag_impl_callbacks_);
+            std::swap(adapter, diag_clock_adapter_callbacks_);
+        }
+        auto report = [this, elapsed_ms](const wchar_t* stage, const callback_diagnostic_counts& counts) {
+            std::wostringstream text;
+            text << L" callback-diag stage=" << stage << L" interval-ms=" << elapsed_ms << L" calls=" << counts.calls
+                 << L" calls-per-sec=" << (1000.0 * static_cast<double>(counts.calls) / static_cast<double>(elapsed_ms))
+                 << L" requested-positive-sample-frames=" << counts.positive_samples << L" zero-calls="
+                 << counts.zero_calls << L" negative-calls=" << counts.negative_calls << L" request-min="
+                 << counts.request_min << L" request-max=" << counts.request_max << L" gaps=" << counts.gaps
+                 << L" gap-min-us=" << counts.gap_min_us << L" gap-max-us=" << counts.gap_max_us << L" gap-mean-us="
+                 << (counts.gaps ? static_cast<double>(counts.gap_sum_us) / static_cast<double>(counts.gaps) : 0.0)
+                 << L" request-hist={";
+            for (const auto& request : counts.requests)
+                text << request.first << L":" << request.second << L",";
+            text << L"} returns={";
+            for (const auto& path : counts.returns)
+                text << path.first << L":" << path.second.first << L"/" << path.second.second << L",";
+            text << L"}";
+            CASPAR_LOG(info) << print() << text.str();
+        };
+        report(L"receive_impl", impl);
+        report(L"receive_clock_adapted", adapter);
+    }
+
+    capture_owner_key capture_owner_key_value() const { return {device_index_, static_cast<int>(channel_)}; }
 
     std::uint64_t claim_capture_ownership()
     {
         std::lock_guard<std::mutex> lock(g_capture_owner_mutex);
-        const auto key = capture_owner_key_value();
-        const auto it  = g_capture_owners.find(key);
-        const std::uint64_t previous = it == g_capture_owners.end() ? 0 : it->second;
-        g_capture_owners[key] = capture_owner_token_;
-        capture_ownership_claimed_ = true;
+        const auto                  key      = capture_owner_key_value();
+        const auto                  it       = g_capture_owners.find(key);
+        const std::uint64_t         previous = it == g_capture_owners.end() ? 0 : it->second;
+        g_capture_owners[key]                = capture_owner_token_;
+        capture_ownership_claimed_           = true;
         return previous;
     }
 
@@ -398,8 +466,8 @@ class aja_producer final : public core::frame_producer
             return;
 
         std::lock_guard<std::mutex> lock(g_capture_owner_mutex);
-        const auto key = capture_owner_key_value();
-        const auto it  = g_capture_owners.find(key);
+        const auto                  key = capture_owner_key_value();
+        const auto                  it  = g_capture_owners.find(key);
         if (it != g_capture_owners.end() && it->second == capture_owner_token_) {
             if (previous_capture_owner_token_ != 0)
                 it->second = previous_capture_owner_token_;
@@ -415,7 +483,7 @@ class aja_producer final : public core::frame_producer
             return;
 
         std::lock_guard<std::mutex> lock(g_capture_owner_mutex);
-        const auto it = g_capture_owners.find(capture_owner_key_value());
+        const auto                  it = g_capture_owners.find(capture_owner_key_value());
         if (it == g_capture_owners.end() || it->second != capture_owner_token_)
             return;
 
@@ -432,8 +500,8 @@ class aja_producer final : public core::frame_producer
             return;
 
         std::lock_guard<std::mutex> lock(g_capture_owner_mutex);
-        const auto key = capture_owner_key_value();
-        const auto it  = g_capture_owners.find(key);
+        const auto                  key = capture_owner_key_value();
+        const auto                  it  = g_capture_owners.find(key);
         if (it == g_capture_owners.end() || it->second != capture_owner_token_) {
             capture_ownership_claimed_ = false;
             return;
@@ -530,12 +598,50 @@ class aja_producer final : public core::frame_producer
             CASPAR_THROW_EXCEPTION(user_error()
                                    << msg_info("Selected AJA device cannot capture normalized video format"));
 
+        if (caspar::diagnostics::cadence_enabled()) {
+            const bool supports_multiformat = device_.features().CanDoMultiFormat();
+
+            bool       multiformat_enabled = false;
+            const bool mode_read_ok        = device_.GetMultiFormatMode(multiformat_enabled);
+
+            NTV2VideoFormat channel1_format = NTV2_FORMAT_UNKNOWN;
+            NTV2VideoFormat channel3_format = NTV2_FORMAT_UNKNOWN;
+
+            const bool ch1_ok = device_.GetVideoFormat(channel1_format, NTV2_CHANNEL1);
+            const bool ch3_ok = device_.GetVideoFormat(channel3_format, NTV2_CHANNEL3);
+
+            CASPAR_LOG(info) << L"AJA format diagnostic (before-input-format): capable=" << supports_multiformat << L" mode_read_ok="
+                             << mode_read_ok << L" enabled=" << multiformat_enabled << L" ch1_read_ok=" << ch1_ok
+                             << L" ch1_format=" << static_cast<int>(channel1_format) << L" ch3_read_ok=" << ch3_ok
+                             << L" ch3_format=" << static_cast<int>(channel3_format);
+        }
+
         if (!device_.SetVideoFormat(capture_format, false, false, channel_))
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to set AJA input video format"));
 
+        if (caspar::diagnostics::cadence_enabled()) {
+            const bool supports_multiformat = device_.features().CanDoMultiFormat();
+            bool multiformat_enabled = false;
+            const bool mode_read_ok_after = device_.GetMultiFormatMode(multiformat_enabled);
+
+            NTV2VideoFormat channel1_format = NTV2_FORMAT_UNKNOWN;
+            NTV2VideoFormat channel3_format = NTV2_FORMAT_UNKNOWN;
+
+            const bool ch1_ok_after = device_.GetVideoFormat(channel1_format, NTV2_CHANNEL1);
+            const bool ch3_ok_after = device_.GetVideoFormat(channel3_format, NTV2_CHANNEL3);
+
+            CASPAR_LOG(info) << L"AJA format diagnostic (after-input-format): capable=" << supports_multiformat
+                             << L" mode_read_ok=" << mode_read_ok_after << L" enabled=" << multiformat_enabled
+                             << L" ch1_read_ok=" << ch1_ok_after
+                             << L" ch1_format=" << static_cast<int>(channel1_format)
+                             << L" ch3_read_ok=" << ch3_ok_after
+                             << L" ch3_format=" << static_cast<int>(channel3_format);
+        }
+
         device_.SetSDIInLevelBtoLevelAConversion(channel_, level_b_to_a);
 
-        CASPAR_LOG(info) << print() << L" SDI 3G input detected: " << (is_3gb ? L"yes" : L"no")
+        if (caspar::diagnostics::cadence_enabled())
+            CASPAR_LOG(info) << print() << L" SDI 3G input detected: " << (is_3gb ? L"yes" : L"no")
                          << L"; Level B to Level A conversion: " << (level_b_to_a ? L"enabled" : L"disabled");
 
         device_.SetVANCMode(NTV2_VANCMODE_OFF, channel_);
@@ -555,12 +661,10 @@ class aja_producer final : public core::frame_producer
 
         aja_audio_channels_ = static_cast<ULWord>(device_.features().GetMaxAudioChannels());
         if (aja_audio_channels_ == 0 || aja_audio_channels_ > kCasparAudioChannels)
-            CASPAR_THROW_EXCEPTION(caspar_exception()
-                                   << msg_info("Unsupported AJA embedded audio channel count"));
+            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unsupported AJA embedded audio channel count"));
 
         if (!device_.SetNumberAudioChannels(aja_audio_channels_, audio_system_))
-            CASPAR_THROW_EXCEPTION(caspar_exception()
-                                   << msg_info("Unable to configure AJA embedded audio input"));
+            CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to configure AJA embedded audio input"));
 
         ULWord configured_audio_channels = 0;
         if (!device_.GetNumberAudioChannels(configured_audio_channels, audio_system_) ||
@@ -578,15 +682,20 @@ class aja_producer final : public core::frame_producer
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unable to disable AJA audio loopback"));
 
         AVChannelLayout swr_layout = AV_CHANNEL_LAYOUT_HEXADECAGONAL;
-        if (swr_alloc_set_opts2(&progressive_audio_swr_,
-                                &swr_layout, AV_SAMPLE_FMT_S32, kProgressiveAudioRate,
-                                &swr_layout, AV_SAMPLE_FMT_S32, kProgressiveAudioRate,
-                                0, nullptr) < 0 || !progressive_audio_swr_ ||
-            swr_init(progressive_audio_swr_) < 0) {
-            if (progressive_audio_swr_)
-                swr_free(&progressive_audio_swr_);
+        if (swr_alloc_set_opts2(&clock_adapter_audio_swr_,
+                                &swr_layout,
+                                AV_SAMPLE_FMT_S32,
+                                kAudioRate,
+                                &swr_layout,
+                                AV_SAMPLE_FMT_S32,
+                                kAudioRate,
+                                0,
+                                nullptr) < 0 ||
+            !clock_adapter_audio_swr_ || swr_init(clock_adapter_audio_swr_) < 0) {
+            if (clock_adapter_audio_swr_)
+                swr_free(&clock_adapter_audio_swr_);
             CASPAR_THROW_EXCEPTION(caspar_exception()
-                                   << msg_info("Unable to initialize AJA progressive audio clock resampler"));
+                                   << msg_info("Unable to initialize AJA clock-adapted audio clock resampler"));
         }
 
         const NTV2OutputXptID input_xpt       = ::GetInputSourceOutputXpt(input_source_);
@@ -611,18 +720,17 @@ class aja_producer final : public core::frame_producer
         capture_buffer_.resize(static_cast<std::size_t>(format_desc.GetVideoWriteSize()));
         capture_audio_buffer_.resize(256 * 1024);
 
-
-        state_["device"]            = static_cast<int64_t>(device_index_ + 1);
-        state_["channel"]           = static_cast<int64_t>(static_cast<int>(channel_) + 1);
-        state_["format"]            = input_format_desc_.name;
-        state_["audio/sample-rate"] = static_cast<int64_t>(48000);
-        state_["audio/channels"]    = static_cast<int64_t>(kCasparAudioChannels);
+        state_["device"]                  = static_cast<int64_t>(device_index_ + 1);
+        state_["channel"]                 = static_cast<int64_t>(static_cast<int>(channel_) + 1);
+        state_["format"]                  = input_format_desc_.name;
+        state_["audio/sample-rate"]       = static_cast<int64_t>(48000);
+        state_["audio/channels"]          = static_cast<int64_t>(kCasparAudioChannels);
         state_["audio/hardware-channels"] = static_cast<int64_t>(aja_audio_channels_);
 
         CASPAR_LOG(info) << L"AJA producer initialized: device " << (device_index_ + 1) << L", input channel "
-                         << (static_cast<int>(channel_) + 1) << L", detected " << input_format_desc_.name
-                         << L", " << aja_audio_channels_ << L"-channel 48 kHz embedded audio"
-                         << L" -> " << kCasparAudioChannels << L"-channel Caspar layout";
+                         << (static_cast<int>(channel_) + 1) << L", detected " << input_format_desc_.name << L", "
+                         << aja_audio_channels_ << L"-channel 48 kHz embedded audio" << L" -> " << kCasparAudioChannels
+                         << L"-channel Caspar layout";
     }
 
     void monitor_signal_without_frame()
@@ -637,6 +745,55 @@ class aja_producer final : public core::frame_producer
         // disappears. Probe receiver state independently so signal-loss
         // detection does not depend on a successful transfer.
         (void)input_frame_is_stable();
+    }
+
+    void observe_diagnostic_reservoir(std::size_t frames)
+    {
+        if (!caspar::diagnostics::cadence_enabled())
+            return;
+
+        std::lock_guard<std::mutex> lock(diag_reservoir_mutex_);
+        diag_reservoir_min_ = std::min(diag_reservoir_min_, frames);
+        diag_reservoir_max_ = std::max(diag_reservoir_max_, frames);
+        ++diag_reservoir_observations_;
+    }
+
+    // Called only by the capture thread, including while no signal is present.
+    void report_audio_diagnostics()
+    {
+        if (!caspar::diagnostics::cadence_enabled())
+            return;
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now - diag_last_report_ < std::chrono::seconds(1))
+            return;
+        const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - diag_last_report_).count();
+        diag_last_report_     = now;
+        std::size_t minimum, maximum, observations;
+        {
+            std::lock_guard<std::mutex> lock(diag_reservoir_mutex_);
+            minimum                      = diag_reservoir_min_;
+            maximum                      = diag_reservoir_max_;
+            observations                 = diag_reservoir_observations_;
+            diag_reservoir_min_          = static_cast<std::size_t>(-1);
+            diag_reservoir_max_          = 0;
+            diag_reservoir_observations_ = 0;
+        }
+
+        report_callback_diagnostics(elapsed_ms);
+
+        CASPAR_LOG(info) << print() << L" audio-diag interval-ms=" << elapsed_ms << L" captured="
+                         << diag_captured_.exchange(0, std::memory_order_relaxed) << L" raw-dropped="
+                         << diag_raw_dropped_.exchange(0, std::memory_order_relaxed) << L" raw-audio-dropped="
+                         << diag_raw_audio_dropped_.exchange(0, std::memory_order_relaxed) << L" packaged-dropped="
+                         << diag_packaged_dropped_.exchange(0, std::memory_order_relaxed) << L" packaged-audio-dropped="
+                         << diag_packaged_audio_dropped_.exchange(0, std::memory_order_relaxed) << L" swr-input="
+                         << diag_swr_input_.exchange(0, std::memory_order_relaxed) << L" swr-output="
+                         << diag_swr_output_.exchange(0, std::memory_order_relaxed) << L" reservoir-min="
+                         << (minimum == static_cast<std::size_t>(-1) ? 0 : minimum) << L" reservoir-max=" << maximum
+                         << L" reservoir-observations=" << observations << L" underflows="
+                         << diag_underflows_.exchange(0, std::memory_order_relaxed) << L" missing-output="
+                         << diag_missing_output_.exchange(0, std::memory_order_relaxed);
     }
 
     void capture_loop()
@@ -655,6 +812,7 @@ class aja_producer final : public core::frame_producer
             AUTOCIRCULATE_TRANSFER transfer;
 
             while (!stop_requested_) {
+                report_audio_diagnostics();
                 AUTOCIRCULATE_STATUS status;
                 device_.AutoCirculateGetStatus(channel_, status);
 
@@ -669,12 +827,19 @@ class aja_producer final : public core::frame_producer
                         continue;
                     }
 
+                    if (caspar::diagnostics::cadence_enabled()) {
+                        const auto audio_bytes = transfer.GetCapturedAudioByteCount();
+                        const auto frame_bytes = aja_audio_channels_ * sizeof(std::int32_t);
+                        if (frame_bytes != 0 && audio_bytes <= capture_audio_buffer_.size() &&
+                            audio_bytes % frame_bytes == 0)
+                            diag_captured_.fetch_add(audio_bytes / frame_bytes, std::memory_order_relaxed);
+                    }
+
                     if (!input_frame_is_stable())
                         continue;
 
-                    const ULWord audio_bytes = transfer.GetCapturedAudioByteCount();
-                    const ULWord hardware_bytes_per_sample_frame =
-                        aja_audio_channels_ * sizeof(std::int32_t);
+                    const ULWord audio_bytes                     = transfer.GetCapturedAudioByteCount();
+                    const ULWord hardware_bytes_per_sample_frame = aja_audio_channels_ * sizeof(std::int32_t);
 
                     if (audio_bytes == 0 || audio_bytes > capture_audio_buffer_.size() ||
                         audio_bytes % hardware_bytes_per_sample_frame != 0) {
@@ -690,14 +855,11 @@ class aja_producer final : public core::frame_producer
 
                     // AJA transfers are interleaved using the hardware audio-system
                     // channel count. Normalize immediately to CasparCG's fixed
-                    // 16-channel layout so all downstream queue, interlaced A/B,
-                    // and progressive audio logic remains unchanged.
-                    const std::size_t captured_sample_frames =
-                        audio_bytes / hardware_bytes_per_sample_frame;
+                    // 16-channel layout used by the capture queue and shared audio adapter.
+                    const std::size_t captured_sample_frames = audio_bytes / hardware_bytes_per_sample_frame;
                     raw.audio.assign(captured_sample_frames * kCasparAudioChannels, 0);
 
-                    const auto* hardware_audio =
-                        reinterpret_cast<const std::int32_t*>(capture_audio_buffer_.data());
+                    const auto* hardware_audio = reinterpret_cast<const std::int32_t*>(capture_audio_buffer_.data());
 
                     for (std::size_t sample = 0; sample < captured_sample_frames; ++sample) {
                         std::copy_n(hardware_audio + sample * aja_audio_channels_,
@@ -705,14 +867,17 @@ class aja_producer final : public core::frame_producer
                                     raw.audio.data() + sample * kCasparAudioChannels);
                     }
 
-
                     {
                         std::lock_guard<std::mutex> lock(raw_mutex_);
                         raw_queue_.emplace_back(std::move(raw));
                         if (raw_queue_.size() > kRawQueueCapacity) {
+                            if (caspar::diagnostics::cadence_enabled())
+                                diag_raw_dropped_.fetch_add(1, std::memory_order_relaxed);
+                            if (caspar::diagnostics::cadence_enabled())
+                                diag_raw_audio_dropped_.fetch_add(raw_queue_.front().audio.size() / kCasparAudioChannels,
+                                                              std::memory_order_relaxed);
                             raw_queue_.pop_front();
-                            CASPAR_LOG(info) << print()
-                                             << L" raw capture queue: overflow; dropped oldest frame";
+                            CASPAR_LOG(info) << print() << L" raw capture queue: overflow; dropped oldest frame";
                         }
                     }
 
@@ -743,7 +908,7 @@ class aja_producer final : public core::frame_producer
         try {
             while (!stop_requested_) {
                 raw_captured_frame raw;
-                bool have_raw = false;
+                bool               have_raw = false;
 
                 {
                     std::lock_guard<std::mutex> lock(raw_mutex_);
@@ -765,7 +930,6 @@ class aja_producer final : public core::frame_producer
                 captured.uyvy       = std::move(raw.uyvy);
                 captured.audio      = std::move(raw.audio);
 
-
                 {
                     std::lock_guard<std::mutex> lock(frame_mutex_);
 
@@ -775,8 +939,7 @@ class aja_producer final : public core::frame_producer
                     // packaged FIFO after both queues have been flushed.
                     const auto current_generation = capture_generation_.load(std::memory_order_acquire);
                     if (captured.generation != current_generation) {
-                        CASPAR_LOG(info) << print()
-                                         << L" capture generation: discarded stale packaged frame seq="
+                        CASPAR_LOG(info) << print() << L" capture generation: discarded stale packaged frame seq="
                                          << captured.sequence << L", frame-generation=" << captured.generation
                                          << L", current-generation=" << current_generation;
                         continue;
@@ -784,18 +947,20 @@ class aja_producer final : public core::frame_producer
 
                     capture_queue_.emplace_back(std::move(captured));
 
-                    if (capture_queue_.size() > kCaptureQueueCapacity)
+                    if (capture_queue_.size() > kCaptureQueueCapacity) {
+                        if (caspar::diagnostics::cadence_enabled())
+                            diag_packaged_dropped_.fetch_add(1, std::memory_order_relaxed);
+                        if (caspar::diagnostics::cadence_enabled())
+                            diag_packaged_audio_dropped_.fetch_add(
+                            capture_queue_.front().audio.size() / kCasparAudioChannels, std::memory_order_relaxed);
                         capture_queue_.pop_front();
+                    }
 
-                    if (!capture_queue_primed_ &&
-                        capture_queue_.size() >= capture_queue_prime_target_) {
+                    if (!capture_queue_primed_ && capture_queue_.size() >= capture_queue_prime_target_) {
                         capture_queue_primed_ = true;
-                        CASPAR_LOG(info) << print()
-                                         << (capture_queue_prime_target_ == kCaptureQueueStartupPrebuffer
-                                                 ? L" capture queue: primed "
-                                                 : L" capture queue: rebuffered ")
-                                         << capture_queue_.size() << L"/"
-                                         << kCaptureQueueCapacity;
+                        if (caspar::diagnostics::cadence_enabled())
+                            CASPAR_LOG(info) << print() << L" capture queue: primed "
+                                             << capture_queue_.size() << L"/" << kCaptureQueueCapacity;
                     }
                 }
             }
@@ -819,8 +984,7 @@ class aja_producer final : public core::frame_producer
         const bool format_good = detected_format == input_format_;
 
         const bool receiver_good =
-            format_good &&
-            (!have_sdi_status || (input_status.mLocked && !input_status.mFrameTRSError));
+            format_good && (!have_sdi_status || (input_status.mLocked && !input_status.mFrameTRSError));
 
         if (!receiver_good) {
             if (signal_was_good_) {
@@ -837,8 +1001,7 @@ class aja_producer final : public core::frame_producer
                 capture_queue_.clear();
                 capture_queue_primed_       = false;
                 capture_queue_prime_target_ = kCaptureQueueStartupPrebuffer;
-                interlaced_phase_reset_requested_.store(true);
-                progressive_reset_requested_.store(true);
+                clock_adapter_reset_requested_.store(true);
             }
 
             signal_was_good_        = false;
@@ -863,7 +1026,11 @@ class aja_producer final : public core::frame_producer
     core::draw_frame
     make_caspar_frame(const std::vector<std::uint8_t>& uyvy, const std::int32_t* audio, std::size_t audio_values)
     {
-        core::pixel_format_desc pixel_desc(core::pixel_format::uyvy, core::color_space::bt709);
+        caspar::diagnostics::cadence_scope aja_make_frame_scope(aja_make_frame_,
+                                                                clock_adapter_audio_started_,
+                                                                audio_values / kCasparAudioChannels,
+                                                                [&] { return print(); });
+        core::pixel_format_desc            pixel_desc(core::pixel_format::uyvy, core::color_space::bt709);
 
         // Match CasparCG's native AV_PIX_FMT_UYVY422 representation.
         // Both logical planes contain the same packed UYVY bytes, exposed
@@ -879,8 +1046,7 @@ class aja_producer final : public core::frame_producer
 
         const std::size_t active_uyvy_bytes = width_ * height_ * 2u;
 
-        if (uyvy.size() < active_uyvy_bytes ||
-            luma_view.size() != active_uyvy_bytes ||
+        if (uyvy.size() < active_uyvy_bytes || luma_view.size() != active_uyvy_bytes ||
             chroma_view.size() != active_uyvy_bytes)
             CASPAR_THROW_EXCEPTION(caspar_exception() << msg_info("Unexpected CasparCG UYVY frame buffer size"));
 
@@ -894,16 +1060,12 @@ class aja_producer final : public core::frame_producer
         tbb::parallel_invoke(
             [&]() {
                 tbb::parallel_for(std::size_t{0}, height_, [&](std::size_t y) {
-                    std::memcpy(luma_view.data() + y * row_bytes,
-                                uyvy.data() + y * row_bytes,
-                                row_bytes);
+                    std::memcpy(luma_view.data() + y * row_bytes, uyvy.data() + y * row_bytes, row_bytes);
                 });
             },
             [&]() {
                 tbb::parallel_for(std::size_t{0}, height_, [&](std::size_t y) {
-                    std::memcpy(chroma_view.data() + y * row_bytes,
-                                uyvy.data() + y * row_bytes,
-                                row_bytes);
+                    std::memcpy(chroma_view.data() + y * row_bytes, uyvy.data() + y * row_bytes, row_bytes);
                 });
             });
 
@@ -913,36 +1075,41 @@ class aja_producer final : public core::frame_producer
         return core::draw_frame(std::move(frame));
     }
 
-    void reset_progressive_audio_resampler()
+    void reset_clock_adapter_audio_resampler()
     {
-        if (progressive_audio_swr_) {
-            swr_close(progressive_audio_swr_);
-            if (swr_init(progressive_audio_swr_) < 0)
+        if (clock_adapter_audio_swr_) {
+            swr_close(clock_adapter_audio_swr_);
+            if (swr_init(clock_adapter_audio_swr_) < 0)
                 CASPAR_THROW_EXCEPTION(caspar_exception()
-                                       << msg_info("Unable to reset AJA progressive audio clock resampler"));
+                                       << msg_info("Unable to reset AJA clock-adapted audio clock resampler"));
         }
-        progressive_audio_filter_initialized_ = false;
-        progressive_audio_filtered_depth_ = static_cast<double>(kProgressiveAudioTargetFrames);
-        progressive_audio_swr_primed_ = false;
-        progressive_audio_input_phase_ = 0.0;
-        progressive_audio_correction_ppm_ = 0;
-        progressive_audio_compensation_delta_ = 0;
+        clock_adapter_audio_filter_initialized_ = false;
+        clock_adapter_audio_filtered_depth_     = static_cast<double>(kAudioTargetFrames);
+        clock_adapter_audio_swr_primed_         = false;
+        clock_adapter_audio_input_phase_        = 0.0;
+        clock_adapter_audio_correction_ppm_     = 0;
+        clock_adapter_audio_compensation_delta_ = 0;
     }
 
-    core::draw_frame receive_progressive(int requested_samples)
+    core::draw_frame receive_clock_adapted(int requested_samples)
     {
+        diagnostic_callback_entry(true, requested_samples);
+
         if (requested_samples <= 0) {
-            return latched_frame_a_ ? core::draw_frame::still(latched_frame_a_)
-                                    : core::draw_frame::empty();
+            diagnostic_callback_return(true,
+                                       latched_frame_a_ ? L"clock-adapted.nonpositive.still"
+                                                        : L"clock-adapted.nonpositive.empty",
+                                       requested_samples);
+            return latched_frame_a_ ? core::draw_frame::still(latched_frame_a_) : core::draw_frame::empty();
         }
 
-        if (progressive_reset_requested_.exchange(false)) {
-            progressive_audio_.clear();
-            progressive_audio_offset_ = 0;
-            progressive_audio_started_ = false;
-            reset_progressive_audio_resampler();
-            progressive_generation_   = capture_generation_.load(std::memory_order_acquire);
-            progressive_sequence_     = 0;
+        if (clock_adapter_reset_requested_.exchange(false)) {
+            clock_adapter_audio_.clear();
+            clock_adapter_audio_offset_  = 0;
+            clock_adapter_audio_started_ = false;
+            reset_clock_adapter_audio_resampler();
+            clock_adapter_generation_ = capture_generation_.load(std::memory_order_acquire);
+            clock_adapter_sequence_   = 0;
         }
 
         std::vector<captured_frame> available;
@@ -952,8 +1119,11 @@ class aja_producer final : public core::frame_producer
             // Preserve the startup prebuffer, but once started never force a
             // rebuffer merely because the two clocks cross between frames.
             if (!capture_queue_primed_) {
-                return latched_frame_a_ ? core::draw_frame::still(latched_frame_a_)
-                                        : core::draw_frame::empty();
+                diagnostic_callback_return(true,
+                                           latched_frame_a_ ? L"clock-adapted.unprimed.still"
+                                                            : L"clock-adapted.unprimed.empty",
+                                           requested_samples);
+                return latched_frame_a_ ? core::draw_frame::still(latched_frame_a_) : core::draw_frame::empty();
             }
 
             while (!capture_queue_.empty()) {
@@ -963,100 +1133,92 @@ class aja_producer final : public core::frame_producer
         }
 
         for (auto& captured : available) {
-            if (captured.generation != progressive_generation_) {
-                progressive_generation_ = captured.generation;
-                progressive_sequence_   = 0;
-                progressive_audio_.clear();
-                progressive_audio_offset_ = 0;
-                progressive_audio_started_ = false;
-                reset_progressive_audio_resampler();
+            if (captured.generation != clock_adapter_generation_) {
+                clock_adapter_generation_ = captured.generation;
+                clock_adapter_sequence_   = 0;
+                clock_adapter_audio_.clear();
+                clock_adapter_audio_offset_  = 0;
+                clock_adapter_audio_started_ = false;
+                reset_clock_adapter_audio_resampler();
             }
 
-            if (progressive_sequence_ != 0 && captured.sequence <= progressive_sequence_) {
-                CASPAR_LOG(warning) << print()
-                                    << L" capture sequence anomaly: previous=" << progressive_sequence_
-                                    << L", current=" << captured.sequence
-                                    << L", generation=" << captured.generation;
+            if (clock_adapter_sequence_ != 0 && captured.sequence <= clock_adapter_sequence_) {
+                CASPAR_LOG(warning) << print() << L" capture sequence anomaly: previous=" << clock_adapter_sequence_
+                                    << L", current=" << captured.sequence << L", generation=" << captured.generation;
             }
-            progressive_sequence_ = captured.sequence;
+            clock_adapter_sequence_ = captured.sequence;
 
             // Keep only the newest video raster. Intermediate physical frames
             // may be skipped when Caspar runs slower than the input clock.
-            progressive_video_uyvy_ = std::move(captured.uyvy);
+            clock_adapter_video_uyvy_ = std::move(captured.uyvy);
 
             // Audio is different: retain every captured sample in order.
-            progressive_audio_.insert(progressive_audio_.end(),
-                                      captured.audio.begin(),
-                                      captured.audio.end());
+            clock_adapter_audio_.insert(clock_adapter_audio_.end(), captured.audio.begin(), captured.audio.end());
         }
 
-        if (progressive_video_uyvy_.empty())
-            return latched_frame_a_ ? core::draw_frame::still(latched_frame_a_)
-                                    : core::draw_frame::empty();
+        if (clock_adapter_video_uyvy_.empty()) {
+            diagnostic_callback_return(true,
+                                       latched_frame_a_ ? L"clock-adapted.no-video.still" : L"clock-adapted.no-video.empty",
+                                       requested_samples);
+            return latched_frame_a_ ? core::draw_frame::still(latched_frame_a_) : core::draw_frame::empty();
+
+        }
 
         const std::size_t requested_frames = static_cast<std::size_t>(requested_samples);
         const std::size_t requested_values = requested_frames * kCasparAudioChannels;
-        const std::size_t available_values =
-            progressive_audio_.size() > progressive_audio_offset_
-                ? progressive_audio_.size() - progressive_audio_offset_
-                : 0u;
-
+        const std::size_t available_values = clock_adapter_audio_.size() > clock_adapter_audio_offset_
+                                                 ? clock_adapter_audio_.size() - clock_adapter_audio_offset_
+                                                 : 0u;
 
         std::vector<std::int32_t> audio_frame(requested_values, 0);
 
-        // Preserve V4.3's startup/recovery shock absorber.  The external FIFO
+        // Preserve the startup/recovery shock absorber.  The external FIFO
         // is the authoritative reserve; SWR is not allowed to become the
         // reservoir.
         const std::size_t available_frames = available_values / kCasparAudioChannels;
-        if (!progressive_audio_started_ &&
-            available_frames >= kProgressiveAudioTargetFrames) {
-            progressive_audio_started_ = true;
-            progressive_audio_filter_initialized_ = true;
-            progressive_audio_filtered_depth_ = static_cast<double>(available_frames);
-            CASPAR_LOG(info) << print()
-                             << L" progressive audio reservoir primed "
-                             << available_frames << L"/"
-                             << kProgressiveAudioTargetFrames << L" frames";
+        observe_diagnostic_reservoir(available_frames);
+        if (!clock_adapter_audio_started_ && available_frames >= kAudioTargetFrames) {
+            clock_adapter_audio_started_            = true;
+            clock_adapter_audio_filter_initialized_ = true;
+            clock_adapter_audio_filtered_depth_     = static_cast<double>(available_frames);
+            if (caspar::diagnostics::cadence_enabled())
+                CASPAR_LOG(info) << print() << L" clock-adapted audio reservoir primed " << available_frames << L"/"
+                             << kAudioTargetFrames << L" frames";
         }
 
         int produced_frames = 0;
 
-        if (progressive_audio_started_ && progressive_audio_swr_) {
+        if (clock_adapter_audio_started_ && clock_adapter_audio_swr_) {
             // Slow estimator: sample the external reserve AFTER newly captured
             // audio has arrived but BEFORE this callback consumes its block.
-            // This is the same useful phase that made V4.3 stable, but the
+            // Observe depth at the same phase on every callback; the
             // servo reacts only to the long-term average, not one bad callback.
-            if (!progressive_audio_filter_initialized_) {
-                progressive_audio_filtered_depth_ = static_cast<double>(available_frames);
-                progressive_audio_filter_initialized_ = true;
+            if (!clock_adapter_audio_filter_initialized_) {
+                clock_adapter_audio_filtered_depth_     = static_cast<double>(available_frames);
+                clock_adapter_audio_filter_initialized_ = true;
             } else {
-                progressive_audio_filtered_depth_ +=
-                    kProgressiveAudioFilterAlpha *
-                    (static_cast<double>(available_frames) - progressive_audio_filtered_depth_);
+                clock_adapter_audio_filtered_depth_ +=
+                    kAudioFilterAlpha *
+                    (static_cast<double>(available_frames) - clock_adapter_audio_filtered_depth_);
             }
 
             int correction_ppm = 0;
-            if (progressive_audio_filtered_depth_ < static_cast<double>(kProgressiveAudioLowFrames) ||
-                progressive_audio_filtered_depth_ > static_cast<double>(kProgressiveAudioHighFrames)) {
+            if (clock_adapter_audio_filtered_depth_ < static_cast<double>(kAudioLowFrames) ||
+                clock_adapter_audio_filtered_depth_ > static_cast<double>(kAudioHighFrames)) {
                 const auto filtered_error = static_cast<std::int64_t>(std::llround(
-                    progressive_audio_filtered_depth_ -
-                    static_cast<double>(kProgressiveAudioTargetFrames)));
-                correction_ppm = static_cast<int>(std::clamp<std::int64_t>(
-                    filtered_error,
-                    -kProgressiveAudioMaxCorrectionPpm,
-                    kProgressiveAudioMaxCorrectionPpm));
+                    clock_adapter_audio_filtered_depth_ - static_cast<double>(kAudioTargetFrames)));
+                correction_ppm            = static_cast<int>(std::clamp<std::int64_t>(
+                    filtered_error, -kAudioMaxCorrectionPpm, kAudioMaxCorrectionPpm));
             }
 
-            if (correction_ppm != progressive_audio_correction_ppm_) {
+            if (correction_ppm != clock_adapter_audio_correction_ppm_) {
                 // Telemetry sign: positive ppm means consume input faster.
                 // FFmpeg's positive sample_delta stretches output, so invert.
-                const int sample_delta =
-                    -correction_ppm * kProgressiveAudioCompensationDistance / 1000000;
-                if (swr_set_compensation(progressive_audio_swr_,
-                                         sample_delta,
-                                         kProgressiveAudioCompensationDistance) >= 0) {
-                    progressive_audio_correction_ppm_ = correction_ppm;
-                    progressive_audio_compensation_delta_ = sample_delta;
+                const int sample_delta = -correction_ppm * kAudioCompensationDistance / 1000000;
+                if (swr_set_compensation(clock_adapter_audio_swr_, sample_delta, kAudioCompensationDistance) >=
+                    0) {
+                    clock_adapter_audio_correction_ppm_     = correction_ppm;
+                    clock_adapter_audio_compensation_delta_ = sample_delta;
                 }
             }
 
@@ -1067,36 +1229,35 @@ class aja_producer final : public core::frame_producer
             // occasional +/-1-frame changes rather than a sample slip in the
             // output.  SWR smooths those tiny input-rate changes while always
             // producing Caspar's exact requested block.
-            const double input_budget =
-                static_cast<double>(requested_frames) *
-                    (1.0 + static_cast<double>(progressive_audio_correction_ppm_) / 1000000.0) +
-                progressive_audio_input_phase_;
-            std::size_t desired_input_frames = static_cast<std::size_t>(std::max(0.0, std::floor(input_budget)));
-            progressive_audio_input_phase_ = input_budget - static_cast<double>(desired_input_frames);
+            const double input_budget = static_cast<double>(requested_frames) *
+                                            (1.0 + static_cast<double>(clock_adapter_audio_correction_ppm_) / 1000000.0) +
+                                        clock_adapter_audio_input_phase_;
+            std::size_t  desired_input_frames = static_cast<std::size_t>(std::max(0.0, std::floor(input_budget)));
+            clock_adapter_audio_input_phase_    = input_budget - static_cast<double>(desired_input_frames);
 
-            // One-time small prime covers SWR filter delay.  Unlike V4.4-V4.6,
-            // this headroom is never added again, so the 3200-frame external
+            // One-time small prime covers SWR filter delay. This
+            // headroom is never added again, so the 3200-frame external
             // shock absorber cannot migrate wholesale into SWR.
-            if (!progressive_audio_swr_primed_)
-                desired_input_frames += kProgressiveAudioSWRPrimeFrames;
+            if (!clock_adapter_audio_swr_primed_)
+                desired_input_frames += kAudioSWRPrimeFrames;
 
-            const int input_frames = static_cast<int>(
-                std::min<std::size_t>(available_frames, desired_input_frames));
-            const uint8_t* input_ptr = input_frames > 0
-                ? reinterpret_cast<const uint8_t*>(progressive_audio_.data() + progressive_audio_offset_)
-                : nullptr;
-            const uint8_t* input_planes[1] = {input_ptr};
-            uint8_t* output_ptr = reinterpret_cast<uint8_t*>(audio_frame.data());
-            uint8_t* output_planes[1] = {output_ptr};
+            const int input_frames = static_cast<int>(std::min<std::size_t>(available_frames, desired_input_frames));
+            const uint8_t* input_ptr =
+                input_frames > 0
+                    ? reinterpret_cast<const uint8_t*>(clock_adapter_audio_.data() + clock_adapter_audio_offset_)
+                    : nullptr;
+            const uint8_t* input_planes[1]  = {input_ptr};
+            uint8_t*       output_ptr       = reinterpret_cast<uint8_t*>(audio_frame.data());
+            uint8_t*       output_planes[1] = {output_ptr};
 
-            produced_frames = swr_convert(progressive_audio_swr_,
+            produced_frames = swr_convert(clock_adapter_audio_swr_,
                                           output_planes,
                                           requested_samples,
                                           input_frames > 0 ? input_planes : nullptr,
                                           input_frames);
             if (produced_frames < 0)
                 CASPAR_THROW_EXCEPTION(caspar_exception()
-                                       << msg_info("AJA progressive audio resampler conversion failed"));
+                                       << msg_info("AJA clock-adapted audio resampler conversion failed"));
 
             std::size_t consumed_input_frames = static_cast<std::size_t>(input_frames);
 
@@ -1107,146 +1268,72 @@ class aja_producer final : public core::frame_producer
             // fractional input budget as the normal clock-domain servo; the extra
             // input is consumed only when SWR proves that it needs it to complete
             // the requested fixed-size output block.
-            if (produced_frames < requested_samples &&
-                consumed_input_frames < available_frames) {
-                const int remaining_output = requested_samples - produced_frames;
+            if (produced_frames < requested_samples && consumed_input_frames < available_frames) {
+                const int         remaining_output   = requested_samples - produced_frames;
                 const std::size_t remaining_external = available_frames - consumed_input_frames;
-                const std::size_t topup_input_frames = std::min<std::size_t>(
-                    remaining_external,
-                    static_cast<std::size_t>(remaining_output));
+                const std::size_t topup_input_frames =
+                    std::min<std::size_t>(remaining_external, static_cast<std::size_t>(remaining_output));
 
-                const uint8_t* topup_input_ptr = reinterpret_cast<const uint8_t*>(
-                    progressive_audio_.data() + progressive_audio_offset_ +
-                    consumed_input_frames * kCasparAudioChannels);
+                const uint8_t* topup_input_ptr =
+                    reinterpret_cast<const uint8_t*>(clock_adapter_audio_.data() + clock_adapter_audio_offset_ +
+                                                     consumed_input_frames * kCasparAudioChannels);
                 const uint8_t* topup_input_planes[1] = {topup_input_ptr};
-                uint8_t* topup_output_ptr = reinterpret_cast<uint8_t*>(
+                uint8_t*       topup_output_ptr      = reinterpret_cast<uint8_t*>(
                     audio_frame.data() + static_cast<std::size_t>(produced_frames) * kCasparAudioChannels);
                 uint8_t* topup_output_planes[1] = {topup_output_ptr};
 
-                const int topup_produced = swr_convert(progressive_audio_swr_,
+                const int topup_produced = swr_convert(clock_adapter_audio_swr_,
                                                        topup_output_planes,
                                                        remaining_output,
                                                        topup_input_planes,
                                                        static_cast<int>(topup_input_frames));
                 if (topup_produced < 0)
                     CASPAR_THROW_EXCEPTION(caspar_exception()
-                                           << msg_info("AJA progressive audio resampler top-up conversion failed"));
+                                           << msg_info("AJA clock-adapted audio resampler top-up conversion failed"));
 
                 consumed_input_frames += topup_input_frames;
                 produced_frames += topup_produced;
             }
 
-            progressive_audio_offset_ += consumed_input_frames * kCasparAudioChannels;
-            if (!progressive_audio_swr_primed_ && consumed_input_frames > 0)
-                progressive_audio_swr_primed_ = true;
+            if (caspar::diagnostics::cadence_enabled())
+                diag_swr_input_.fetch_add(consumed_input_frames, std::memory_order_relaxed);
+            if (caspar::diagnostics::cadence_enabled())
+                diag_swr_output_.fetch_add(static_cast<std::uint64_t>(produced_frames), std::memory_order_relaxed);
+            observe_diagnostic_reservoir(available_frames - consumed_input_frames);
+            clock_adapter_audio_offset_ += consumed_input_frames * kCasparAudioChannels;
+            if (!clock_adapter_audio_swr_primed_ && consumed_input_frames > 0)
+                clock_adapter_audio_swr_primed_ = true;
 
             if (produced_frames < requested_samples) {
-                CASPAR_LOG(warning) << print()
-                                    << L" progressive audio underflow after SWR top-up: requested="
-                                    << requested_samples << L", produced=" << produced_frames
-                                    << L", external-before=" << available_frames
-                                    << L", consumed-input=" << consumed_input_frames
-                                    << L", correction-ppm=" << progressive_audio_correction_ppm_
-                                    << L", swr-delay="
-                                    << swr_get_delay(progressive_audio_swr_, kProgressiveAudioRate);
+                if (caspar::diagnostics::cadence_enabled())
+                    diag_underflows_.fetch_add(1, std::memory_order_relaxed);
+                if (caspar::diagnostics::cadence_enabled())
+                    diag_missing_output_.fetch_add(requested_samples - produced_frames, std::memory_order_relaxed);
+                CASPAR_LOG(warning) << print() << L" clock-adapted audio underflow after SWR top-up: requested="
+                                    << requested_samples << L", produced=" << produced_frames << L", external-before="
+                                    << available_frames << L", consumed-input=" << consumed_input_frames
+                                    << L", correction-ppm=" << clock_adapter_audio_correction_ppm_ << L", swr-delay="
+                                    << swr_get_delay(clock_adapter_audio_swr_, kAudioRate);
             }
         }
 
         // Compact occasionally rather than erasing on every callback.
-        if (progressive_audio_offset_ >= 65536 &&
-            progressive_audio_offset_ * 2 >= progressive_audio_.size()) {
-            progressive_audio_.erase(progressive_audio_.begin(),
-                                     progressive_audio_.begin() + progressive_audio_offset_);
-            progressive_audio_offset_ = 0;
+        if (clock_adapter_audio_offset_ >= 65536 && clock_adapter_audio_offset_ * 2 >= clock_adapter_audio_.size()) {
+            clock_adapter_audio_.erase(clock_adapter_audio_.begin(),
+                                     clock_adapter_audio_.begin() + clock_adapter_audio_offset_);
+            clock_adapter_audio_offset_ = 0;
         }
-
 
         // Build a fresh Caspar frame every callback so repeated video can carry
         // the next audio slice. This is intentional clock-domain adaptation,
         // not a capture underflow.
-        latched_frame_a_ = make_caspar_frame(progressive_video_uyvy_,
-                                             audio_frame.data(),
-                                             audio_frame.size());
-        latched_frame_b_ = core::draw_frame::empty();
+        latched_frame_a_ = make_caspar_frame(clock_adapter_video_uyvy_, audio_frame.data(), audio_frame.size());
+
+        diagnostic_callback_return(true,
+                                   available.empty() ? L"clock-adapted.new-frame.cached-video"
+                                                     : L"clock-adapted.new-frame.new-video",
+                                   requested_samples);
         return latched_frame_a_;
-    }
-
-    bool latch_latest_pair(int requested_samples_per_field)
-    {
-        captured_frame captured;
-
-        {
-            std::lock_guard<std::mutex> lock(frame_mutex_);
-
-            if (!capture_queue_primed_)
-                return false;
-
-            if (capture_queue_.empty()) {
-                if (signal_was_good_ && latched_frame_a_) {
-                    CASPAR_LOG(info) << print()
-                                     << L" capture queue: unexpected underflow; rebuffering";
-                }
-                capture_queue_primed_       = false;
-                capture_queue_prime_target_ = kCaptureQueueRebuffer;
-                return false;
-            }
-
-            captured = std::move(capture_queue_.front());
-            capture_queue_.pop_front();
-        }
-
-        if (captured.generation == last_latched_generation_) {
-            if (last_latched_sequence_ != 0 && captured.sequence <= last_latched_sequence_) {
-                CASPAR_LOG(warning) << print()
-                                    << L" capture sequence anomaly: previous=" << last_latched_sequence_
-                                    << L", current=" << captured.sequence
-                                    << L", generation=" << captured.generation;
-            }
-        } else {
-            last_latched_generation_ = captured.generation;
-        }
-        last_latched_sequence_ = captured.sequence;
-
-        auto& uyvy  = captured.uyvy;
-        auto& audio = captured.audio;
-
-        const std::size_t captured_sample_frames = audio.size() / kCasparAudioChannels;
-
-        const std::size_t requested =
-            requested_samples_per_field > 0 ? static_cast<std::size_t>(requested_samples_per_field) : 0u;
-
-        if (input_format_desc_.field_count == 2) {
-            std::vector<std::int32_t> audio_a(requested * kCasparAudioChannels, 0);
-            std::vector<std::int32_t> audio_b(requested * kCasparAudioChannels, 0);
-
-            const std::size_t copy_a_frames = std::min(requested, captured_sample_frames);
-            if (copy_a_frames) {
-                std::memcpy(audio_a.data(), audio.data(), copy_a_frames * kCasparAudioChannels * sizeof(std::int32_t));
-            }
-
-            const std::size_t remaining_frames =
-                captured_sample_frames > copy_a_frames ? captured_sample_frames - copy_a_frames : 0u;
-            const std::size_t copy_b_frames = std::min(requested, remaining_frames);
-            if (copy_b_frames) {
-                std::memcpy(audio_b.data(),
-                            audio.data() + copy_a_frames * kCasparAudioChannels,
-                            copy_b_frames * kCasparAudioChannels * sizeof(std::int32_t));
-            }
-
-            latched_frame_a_ = make_caspar_frame(uyvy, audio_a.data(), audio_a.size());
-            latched_frame_b_ = make_caspar_frame(uyvy, audio_b.data(), audio_b.size());
-        } else {
-            std::vector<std::int32_t> audio_frame(requested * kCasparAudioChannels, 0);
-            const std::size_t         copy_frames = std::min(requested, captured_sample_frames);
-
-            if (copy_frames) {
-                std::memcpy(audio_frame.data(), audio.data(), copy_frames * kCasparAudioChannels * sizeof(std::int32_t));
-            }
-
-            latched_frame_a_ = make_caspar_frame(uyvy, audio_frame.data(), audio_frame.size());
-            latched_frame_b_ = core::draw_frame::empty();
-        }
-        return true;
     }
 
     void rethrow_capture_exception()
