@@ -5,11 +5,7 @@ add_subdirectory(image)
 add_subdirectory(ffmpeg)
 add_subdirectory(oal)
 add_subdirectory(decklink)
-
-if (NOT MSVC)
-    add_subdirectory(aja)
-endif()
-
+add_subdirectory(aja)
 add_subdirectory(screen)
 add_subdirectory(newtek)
 #add_subdirectory(artnet)

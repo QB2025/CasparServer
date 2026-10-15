@@ -3,6 +3,38 @@ cmake_minimum_required (VERSION 3.28)
 include(ExternalProject)
 include(FetchContent)
 
+# AJA NTV2 SDK
+set(AJANTV2_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_DEMOS ON CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_DRIVER ON CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_TESTS ON CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_TOOLS ON CACHE BOOL "" FORCE)
+set(AJANTV2_DISABLE_PLUGIN_LOAD ON CACHE BOOL "" FORCE)
+
+set(AJA_INSTALL_SOURCES OFF CACHE BOOL "" FORCE)
+set(AJA_INSTALL_HEADERS OFF CACHE BOOL "" FORCE)
+set(AJA_INSTALL_LIBS OFF CACHE BOOL "" FORCE)
+set(AJA_INSTALL_CMAKE OFF CACHE BOOL "" FORCE)
+set(AJA_INSTALL_MISC OFF CACHE BOOL "" FORCE)
+
+find_package(Git REQUIRED)
+
+FetchContent_Declare(
+    libajantv2
+    GIT_REPOSITORY https://github.com/aja-video/libajantv2.git
+    GIT_TAG 4add45239a03960aa36de6fef326ee1b753e8ec9
+    GIT_SHALLOW FALSE
+
+    PATCH_COMMAND
+        ${CMAKE_COMMAND}
+            -DSOURCE_DIR=<SOURCE_DIR>
+            -DPATCH_FILE=${CMAKE_CURRENT_LIST_DIR}/patches/libajantv2-remove-transfer-success-log.patch
+            -DGIT_EXECUTABLE=${GIT_EXECUTABLE}
+            -P ${CMAKE_CURRENT_LIST_DIR}/ApplyAjaPatch.cmake
+)
+
+FetchContent_MakeAvailable(libajantv2)
+
 if(POLICY CMP0135)
 	cmake_policy(SET CMP0135 NEW)
 endif()
