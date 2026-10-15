@@ -20,6 +20,7 @@
  */
 
 #include "../StdAfx.h"
+#include <common/diagnostics/cadence.h>
 
 #include "cg_proxy.h"
 #include "frame_producer.h"
@@ -111,8 +112,12 @@ class destroy_producer_proxy : public frame_producer
         });
     }
 
+    caspar::diagnostics::cadence_metric producer_proxy_{L"producer_proxy"};
     draw_frame receive_impl(const core::video_field field, int nb_samples) override
     {
+        caspar::diagnostics::cadence_scope producer_proxy_scope(
+            producer_proxy_, nb_samples > 0, nb_samples,
+            [&] { return print(); });
         return producer_->receive(field, nb_samples);
     }
     std::wstring              print() const override { return producer_->print(); }

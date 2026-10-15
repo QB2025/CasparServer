@@ -19,3 +19,6 @@ src/.idea
 # debian build artifacts
 /debian
 /obj-*
+
+# macOS Finder metadata
+.DS_Store

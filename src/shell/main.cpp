@@ -188,7 +188,7 @@ void terminate_handler()
 
 } // namespace caspar
 
-int main(int argc, char** argv)
+CASPAR_CEF_PROCESS_ENTRY int main(int argc, char** argv)
 {
     using namespace caspar;
 
