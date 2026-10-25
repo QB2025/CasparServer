@@ -25,6 +25,7 @@
 #include "producer/html_cg_proxy.h"
 #include "producer/html_producer.h"
 
+#include <common/cef_process_entry.h>
 #include <common/env.h>
 #include <common/executor.h>
 #include <common/future.h>
@@ -37,7 +38,11 @@
 #include <boost/property_tree/ptree.hpp>
 #include <boost/range/algorithm/remove_if.hpp>
 
+#include <algorithm>
 #include <memory>
+#include <stdexcept>
+#include <string>
+#include <vector>
 #include <utility>
 
 #include <include/cef_app.h>
@@ -98,6 +103,109 @@ class remove_handler : public CefV8Handler
     IMPLEMENT_REFCOUNTING(remove_handler);
 };
 
+namespace {
+
+std::wstring trim_html_switch_text(const std::wstring& text)
+{
+    const auto first = text.find_first_not_of(L" \t\r\n");
+    if (first == std::wstring::npos)
+        return {};
+    return text.substr(first, text.find_last_not_of(L" \t\r\n") - first + 1);
+}
+
+struct html_switch
+{
+    std::wstring name;
+    std::wstring value;
+    bool         has_value;
+};
+
+html_switch parse_html_switch(const std::wstring& text)
+{
+    const auto arg = trim_html_switch_text(text);
+    if (arg.size() < 3 || arg.compare(0, 2, L"--") != 0)
+        throw std::invalid_argument("html.args.arg must be --name or --name=value");
+
+    const auto separator = arg.find(L'=');
+    const auto name = arg.substr(2, separator == std::wstring::npos ? separator : separator - 2);
+    if (name.empty() || name.front() == L'-' ||
+        name.find_first_not_of(L"abcdefghijklmnopqrstuvwxyz0123456789-") != std::wstring::npos)
+        throw std::invalid_argument("html.args.arg switch names must be lowercase ASCII letters, digits or hyphens");
+
+    const auto value = separator == std::wstring::npos ? std::wstring() : arg.substr(separator + 1);
+    if (value.find_first_of(L"\r\n") != std::wstring::npos || value.find(L'\0') != std::wstring::npos)
+        throw std::invalid_argument("html.args.arg values must not contain line breaks or NUL characters");
+    if ((name == L"enable-features" || name == L"disable-features") && trim_html_switch_text(value).empty())
+        throw std::invalid_argument("html.args feature switches require a non-empty comma-separated value");
+
+    return {name, value, separator != std::wstring::npos};
+}
+
+std::wstring merge_html_features(const std::wstring& existing, const std::wstring& configured)
+{
+    std::vector<std::wstring> features;
+    for (const auto& list : {existing, configured}) {
+        std::size_t start = 0;
+        while (start < list.size()) {
+            const auto end = list.find(L',', start);
+            const auto feature = trim_html_switch_text(list.substr(start, end == std::wstring::npos ? end : end - start));
+            if (!feature.empty() && std::find(features.begin(), features.end(), feature) == features.end())
+                features.push_back(feature);
+            if (end == std::wstring::npos)
+                break;
+            start = end + 1;
+        }
+    }
+    std::wstring result;
+    for (const auto& feature : features) {
+        if (!result.empty())
+            result += L",";
+        result += feature;
+    }
+    return result;
+}
+
+std::vector<html_switch> read_configured_html_switches()
+{
+    const auto args = env::properties().get_child_optional(L"configuration.html.args");
+    if (!args)
+        return {};
+
+    // Parse before CefInitialize so invalid configuration never throws across CEF callbacks.
+    std::vector<html_switch> switches;
+    for (const auto& entry : *args) {
+        if (entry.first == L"arg")
+            switches.push_back(parse_html_switch(entry.second.get_value<std::wstring>()));
+    }
+
+    return switches;
+}
+
+void apply_configured_html_switches(CefRefPtr<CefCommandLine> command_line,
+                                    const std::vector<html_switch>& switches)
+{
+    for (const auto& arg : switches) {
+        const bool feature_list = arg.name == L"enable-features" || arg.name == L"disable-features";
+        const auto value = feature_list
+                               ? merge_html_features(command_line->GetSwitchValue(arg.name).ToWString(), arg.value)
+                               : arg.value;
+        command_line->RemoveSwitch(arg.name);
+        if (arg.has_value)
+            command_line->AppendSwitchWithValue(arg.name, value);
+        else
+            command_line->AppendSwitch(arg.name);
+        // Avoid logging arbitrary values, which can contain credentials or URLs.
+        CASPAR_LOG(info) << L"[html] Applied configured CEF switch --" << arg.name;
+    }
+
+    if (!switches.empty()) {
+        CASPAR_LOG(info) << L"[html] CEF disable-features: "
+                         << command_line->GetSwitchValue("disable-features").ToWString();
+    }
+}
+
+} // namespace
+
 class renderer_application
     : public CefApp
     , CefRenderProcessHandler
@@ -105,11 +213,14 @@ class renderer_application
     std::vector<CefRefPtr<CefV8Context>> contexts_;
     const bool                           enable_gpu_;
     const bool                           shared_texture_;
+    const std::vector<html_switch>       configured_switches_;
 
   public:
-    explicit renderer_application(const bool enable_gpu, const bool shared_texture)
+    explicit renderer_application(const bool enable_gpu, const bool shared_texture,
+                                  std::vector<html_switch> configured_switches = {})
         : enable_gpu_(enable_gpu)
         , shared_texture_(shared_texture)
+        , configured_switches_(std::move(configured_switches))
     {
     }
 
@@ -208,12 +319,17 @@ class renderer_application
             command_line->AppendSwitch("disable-gpu-compositing");
             command_line->AppendSwitchWithValue("disable-gpu-vsync", "gpu");
         }
+
+        // Only the browser receives parsed configuration. Chromium forwards
+        // applicable switches to children, whose early entry has no config.
+        if (process_type.empty())
+            apply_configured_html_switches(command_line, configured_switches_);
     }
 
     IMPLEMENT_REFCOUNTING(renderer_application);
 };
 
-bool intercept_command_line(int argc, char** argv)
+CASPAR_CEF_PROCESS_ENTRY bool intercept_command_line(int argc, char** argv)
 {
 #ifdef _WIN32
     CefMainArgs main_args;
@@ -235,6 +351,7 @@ void init(const core::module_dependencies& dependencies)
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
 #endif
         const auto gpu = is_gpu_shared_texture_enabled();
+        const auto configured_switches = read_configured_html_switches();
 
         CefSettings settings;
         settings.command_line_args_disabled   = false;
@@ -252,7 +369,7 @@ void init(const core::module_dependencies& dependencies)
         }
 
         return CefInitialize(
-            main_args, settings, CefRefPtr<CefApp>(new renderer_application(gpu.first, gpu.second)), nullptr);
+            main_args, settings, CefRefPtr<CefApp>(new renderer_application(gpu.first, gpu.second, configured_switches)), nullptr);
     });
 
     if (!result) {

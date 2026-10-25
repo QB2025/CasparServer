@@ -70,6 +70,7 @@ extern "C" {
 
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <thread>
 
 namespace caspar { namespace ffmpeg {
@@ -406,6 +407,12 @@ struct ffmpeg_consumer : public core::frame_consumer
     bool                    realtime_ = false;
     std::int64_t            video_pts = 0;
     std::int64_t            audio_pts = 0;
+    bool                    queue_diagnostics_ = false;
+    int                     frame_buffer_capacity_ = 1;
+    int                     packet_buffer_capacity_ = 1;
+    std::uint64_t           input_frames_ = 0;
+    std::uint64_t           dropped_frames_ = 0;
+    std::size_t             max_input_queue_depth_ = 0;
 
     spl::shared_ptr<diagnostics::graph> graph_;
 
@@ -434,7 +441,29 @@ struct ffmpeg_consumer : public core::frame_consumer
     {
         state_["file/path"] = u8(path_);
 
-        frame_buffer_.set_capacity(realtime_ ? 1 : 64);
+        // Consumer-only options: remove these before forwarding args to FFmpeg.
+        const auto read_consumer_integer = [&](const std::string& name, int fallback, int minimum, int maximum) {
+            const auto requirement = " requires an integer from " + std::to_string(minimum) + " to " +
+                                     std::to_string(maximum);
+            int value = fallback;
+            const boost::regex expression("(^|\\s)-" + name + "(?:\\s+([^\\s]+))?");
+            boost::smatch match;
+            while (boost::regex_search(args_, match, expression)) {
+                if (!match[2].matched)
+                    throw std::invalid_argument(name + requirement);
+                const auto text = match[2].str();
+                std::size_t consumed = 0;
+                value = std::stoi(text, &consumed);
+                if (consumed != text.size() || value < minimum || value > maximum)
+                    throw std::invalid_argument(name + requirement);
+                args_.erase(static_cast<std::size_t>(match.position()), static_cast<std::size_t>(match.length()));
+            }
+            return value;
+        };
+        frame_buffer_capacity_ = read_consumer_integer("stream-frame-buffer", realtime_ ? 1 : 64, 1, 256);
+        packet_buffer_capacity_ = read_consumer_integer("stream-packet-buffer", realtime_ ? 1 : 128, 1, 256);
+        queue_diagnostics_ = read_consumer_integer("stream-queue-diagnostics", 0, 0, 1) != 0;
+        frame_buffer_.set_capacity(frame_buffer_capacity_);
 
         diagnostics::register_graph(graph_);
         graph_->set_color("frame-time", diagnostics::color(0.1f, 1.0f, 0.1f));
@@ -464,6 +493,10 @@ struct ffmpeg_consumer : public core::frame_consumer
         channel_index_ = channel_info.index;
 
         graph_->set_text(print());
+        if (queue_diagnostics_) {
+            CASPAR_LOG(info) << print() << L" Queue capacities: frames=" << frame_buffer_capacity_
+                             << L" packets=" << packet_buffer_capacity_;
+        }
 
         frame_thread_ = std::thread([=, this] {
             try {
@@ -552,7 +585,7 @@ struct ffmpeg_consumer : public core::frame_consumer
                 }
 
                 tbb::concurrent_bounded_queue<std::shared_ptr<AVPacket>> packet_buffer;
-                packet_buffer.set_capacity(realtime_ ? 1 : 128);
+                packet_buffer.set_capacity(packet_buffer_capacity_);
                 auto packet_thread = std::thread([&] {
                     try {
                         CASPAR_SCOPE_EXIT
@@ -650,8 +683,23 @@ struct ffmpeg_consumer : public core::frame_consumer
             }
         }
 
+        ++input_frames_;
         if (!frame_buffer_.try_push({frame, video_pts, audio_pts})) {
+            ++dropped_frames_;
             graph_->set_tag(diagnostics::tag_severity::WARNING, "dropped-frame");
+            if (queue_diagnostics_ && (dropped_frames_ == 1 || dropped_frames_ % 50 == 0)) {
+                CASPAR_LOG(warning) << print() << L" Input queue full: dropped=" << dropped_frames_
+                                    << L" input=" << input_frames_ << L" video_pts=" << video_pts;
+            }
+        }
+
+        const auto queue_depth = frame_buffer_.size();
+        if (queue_depth > 0 && static_cast<std::size_t>(queue_depth) > max_input_queue_depth_)
+            max_input_queue_depth_ = static_cast<std::size_t>(queue_depth);
+        if (queue_diagnostics_ && input_frames_ % 250 == 0) {
+            CASPAR_LOG(info) << print() << L" Input queue: frames=" << input_frames_
+                             << L" dropped=" << dropped_frames_ << L" depth=" << queue_depth
+                             << L" peak=" << max_input_queue_depth_ << L" capacity=" << frame_buffer_capacity_;
         }
 
         video_pts += 1;

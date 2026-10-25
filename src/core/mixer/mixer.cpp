@@ -106,6 +106,9 @@ struct mixer::impl
     void set_master_volume(float volume) { audio_mixer_.set_master_volume(volume); }
 
     float get_master_volume() { return audio_mixer_.get_master_volume(); }
+
+    void set_straight_alpha_output(bool enabled) { image_mixer_->set_straight_alpha_output(enabled); }
+    bool get_straight_alpha_output() const { return image_mixer_->get_straight_alpha_output(); }
 };
 
 mixer::mixer(int channel_index, spl::shared_ptr<diagnostics::graph> graph, spl::shared_ptr<image_mixer> image_mixer)
@@ -114,6 +117,8 @@ mixer::mixer(int channel_index, spl::shared_ptr<diagnostics::graph> graph, spl::
 }
 void        mixer::set_master_volume(float volume) { impl_->set_master_volume(volume); }
 float       mixer::get_master_volume() { return impl_->get_master_volume(); }
+void        mixer::set_straight_alpha_output(bool enabled) { impl_->set_straight_alpha_output(enabled); }
+bool        mixer::get_straight_alpha_output() const { return impl_->get_straight_alpha_output(); }
 const_frame mixer::operator()(std::vector<draw_frame> frames, const video_format_desc& format_desc, int nb_samples)
 {
     return (*impl_)(std::move(frames), format_desc, nb_samples);

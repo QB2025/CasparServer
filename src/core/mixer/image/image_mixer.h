@@ -54,7 +54,7 @@ class image_mixer
     class mutable_frame create_frame(const void* tag, const struct pixel_format_desc& desc) override = 0;
     class mutable_frame create_frame(const void*                     video_stream_tag,
                                      const struct pixel_format_desc& desc,
-                                     common::bit_depth               depth) override                               = 0;
+                                     common::bit_depth               depth) override                 = 0;
 
 #ifdef WIN32
     class const_frame import_d3d_texture(const void*                                             tag,
@@ -64,6 +64,12 @@ class image_mixer
 #endif
 
     virtual common::bit_depth depth() const = 0;
+
+    // Output encoding capability. Accelerators that do not implement
+    // straight-alpha output keep the default no-op/false behavior.
+    virtual void set_straight_alpha_output(bool enabled) {}
+    virtual bool get_straight_alpha_output() const { return false; }
+
 };
 
 }} // namespace caspar::core

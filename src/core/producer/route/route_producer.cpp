@@ -18,6 +18,7 @@
  *
  * Author: Robert Nagy, ronag89@gmail.com
  */
+#include "fix_stream_tag.h"
 #include "route_producer.h"
 
 #include <common/diagnostics/graph.h>
@@ -38,78 +39,10 @@
 #include <tbb/concurrent_queue.h>
 
 #include <optional>
-#include <stack>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace caspar { namespace core {
-
-class fix_stream_tag : public frame_visitor
-{
-    const void*                                                     route_producer_ptr_;
-    std::stack<std::pair<frame_transform, std::vector<draw_frame>>> frames_stack_;
-    std::optional<const_frame>                                      upd_frame_;
-
-    fix_stream_tag(const fix_stream_tag&);
-    fix_stream_tag& operator=(const fix_stream_tag&);
-
-  public:
-    fix_stream_tag(void* stream_tag)
-        : route_producer_ptr_(stream_tag)
-    {
-        frames_stack_ = std::stack<std::pair<frame_transform, std::vector<draw_frame>>>();
-        frames_stack_.emplace(frame_transform{}, std::vector<draw_frame>());
-    }
-
-    void push(const frame_transform& transform) { frames_stack_.emplace(transform, std::vector<core::draw_frame>()); }
-
-    void visit(const const_frame& frame)
-    {
-        // Get original tag from the frame
-        const void* source_tag = frame.stream_tag();
-
-        // Calculate a unique but stable tag for this source
-        // This calculation will always produce the same result for the same inputs
-        intptr_t base_addr   = reinterpret_cast<intptr_t>(route_producer_ptr_);
-        intptr_t source_addr = reinterpret_cast<intptr_t>(source_tag);
-        // Use XOR to create a unique value that combines route producer and source identities
-        intptr_t    unique_value = base_addr ^ source_addr ^ 0xDEADBEEF; // Constant helps avoid collisions
-        const void* unique_tag   = reinterpret_cast<const void*>(unique_value);
-
-        // Apply the tag to the frame
-        upd_frame_ = frame.with_tag(unique_tag);
-    }
-
-    void pop()
-    {
-        auto popped = frames_stack_.top();
-        frames_stack_.pop();
-
-        if (upd_frame_ != std::nullopt) {
-            auto new_frame        = draw_frame(std::move(*upd_frame_));
-            upd_frame_            = std::nullopt;
-            new_frame.transform() = popped.first;
-            frames_stack_.top().second.push_back(std::move(new_frame));
-        } else {
-            auto new_frame        = draw_frame(std::move(popped.second));
-            new_frame.transform() = popped.first;
-            frames_stack_.top().second.push_back(new_frame);
-        }
-    }
-
-    draw_frame operator()(draw_frame frame)
-    {
-        frame.accept(*this);
-
-        auto popped = frames_stack_.top();
-        frames_stack_.pop();
-        draw_frame result = draw_frame(std::move(popped.second));
-
-        frames_stack_ = std::stack<std::pair<frame_transform, std::vector<draw_frame>>>();
-        frames_stack_.emplace(frame_transform{}, std::vector<draw_frame>());
-        return result;
-    }
-};
 
 class route_producer
     : public frame_producer
@@ -182,31 +115,37 @@ class route_producer
         connection_ =
             route_->signal.connect([weak_self](const core::draw_frame& frame1, const core::draw_frame& frame2) {
                 if (auto self = weak_self.lock()) {
-                    auto frame1b = frame1;
-                    if (!frame1b) {
-                        // We got a frame, so ensure it is a real frame (otherwise the layer gets confused)
-                        frame1b = core::draw_frame::push(frame1);
-                    }
+                    try {
+                        auto frame1b = frame1;
+                        if (!frame1b) {
+                            // We got a frame, so ensure it is a real frame (otherwise the layer gets confused)
+                            frame1b = core::draw_frame::push(frame1);
+                        }
 
-                    // Update the tag in the frame to allow the audio mixer to distinguish between the source frame and
-                    // the routed frame
-                    frame1b = self->tag_fix_(frame1b);
+                        // Update the tag in the frame to allow the audio mixer to distinguish between the source frame and
+                        // the routed frame
+                        frame1b = self->tag_fix_(frame1b);
 
-                    auto frame2b = frame2;
-                    if (!frame2b) {
-                        // Ensure that any interlaced channel will repeat frames instead of showing black.
-                        frame2b = frame1b;
-                    } else {
-                        // For interlaced formats, ensure field B gets the proper tag as well
-                        frame2b = self->tag_fix_(frame2b);
-                    }
+                        auto frame2b = frame2;
+                        if (!frame2b) {
+                            // Ensure that any interlaced channel will repeat frames instead of showing black.
+                            frame2b = frame1b;
+                        } else {
+                            // For interlaced formats, ensure field B gets the proper tag as well
+                            frame2b = self->tag_fix_(frame2b);
+                        }
 
-                    if (!self->buffer_.try_push(std::make_pair(frame1b, frame2b))) {
-                        self->graph_->set_tag(diagnostics::tag_severity::WARNING, "dropped-frame");
+                        if (!self->buffer_.try_push(std::make_pair(frame1b, frame2b))) {
+                            self->graph_->set_tag(diagnostics::tag_severity::WARNING, "dropped-frame");
+                        }
+                        self->graph_->set_value("produce-time",
+                                                self->produce_timer_.elapsed() * self->route_->format_desc.fps * 0.5);
+                        self->produce_timer_.restart();
+                    } catch (...) {
+                        // Drop this routed frame, preserving the source channel and other route subscribers.
+                        // The visitor resets its traversal state before the next frame.
+                        CASPAR_LOG_CURRENT_EXCEPTION();
                     }
-                    self->graph_->set_value("produce-time",
-                                            self->produce_timer_.elapsed() * self->route_->format_desc.fps * 0.5);
-                    self->produce_timer_.restart();
                 }
             });
     }

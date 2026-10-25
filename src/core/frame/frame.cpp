@@ -183,14 +183,11 @@ const_frame                      const_frame::with_tag(const void* new_tag) cons
         return const_frame();
     }
 
-    std::vector<array<const std::uint8_t>> image_data_copy = impl_->image_data_;
-    auto                                   new_frame =
-        const_frame(new_tag, std::move(image_data_copy), impl_->audio_data_, impl_->desc_, impl_->texture_);
-
-    new_frame.impl_->geometry_ = impl_->geometry_;
-    if (impl_->opaque_.has_value()) {
-        new_frame.impl_->opaque_ = impl_->opaque_;
-    }
+    // Retag an already valid frame without reconstructing its image storage. GPU-only
+    // frames can have pixel planes but no CPU buffers, with textures held in opaque_.
+    const_frame new_frame;
+    new_frame.impl_       = std::make_shared<impl>(*impl_);
+    new_frame.impl_->tag_ = new_tag;
 
     return new_frame;
 }

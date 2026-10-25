@@ -1,0 +1,13 @@
+diff --git a/ajantv2/src/ntv2autocirculate.cpp b/ajantv2/src/ntv2autocirculate.cpp
+index 0277208e3..ef33ac93c 100644
+--- a/ajantv2/src/ntv2autocirculate.cpp
++++ b/ajantv2/src/ntv2autocirculate.cpp
+@@ -946,7 +946,5 @@ bool CNTV2Card::AutoCirculateTransfer (const NTV2Channel inChannel, AUTOCIRCULAT
+ 	#endif	//	AJA_NTV2_CLEAR_HOST_ANC_BUFFER_TAIL_AFTER_CAPTURE_XFER
+ 
+-	if (result)
+-		ACDBG(GetDescription() << ": Transfer successful for Ch" << DEC(inChannel+1));
+-	else
++	if (!result)
+ 		ACFAIL(GetDescription() << ": Transfer failed on Ch" << DEC(inChannel+1));
+ 	return result;

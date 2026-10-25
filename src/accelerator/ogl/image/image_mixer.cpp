@@ -21,6 +21,7 @@
 #include "image_mixer.h"
 
 #include "image_kernel.h"
+#include "straight_alpha_kernel.h"
 
 #include "../util/buffer.h"
 #include "../util/device.h"
@@ -48,6 +49,7 @@
 #include <GL/glew.h>
 
 #include <any>
+#include <atomic>
 #include <vector>
 
 namespace caspar { namespace accelerator { namespace ogl {
@@ -77,10 +79,11 @@ struct layer
 class image_renderer
 {
     spl::shared_ptr<device> ogl_;
-    image_kernel            kernel_;
-    const size_t            max_frame_size_;
-    common::bit_depth       depth_;
-    bool                    straight_alpha_output_;
+    image_kernel             kernel_;
+    straight_alpha_kernel    straight_alpha_kernel_;
+    const size_t             max_frame_size_;
+    common::bit_depth        depth_;
+    std::atomic<bool>        straight_alpha_output_;
 
   public:
     explicit image_renderer(const spl::shared_ptr<device>& ogl,
@@ -89,10 +92,21 @@ class image_renderer
                             bool                          straight_alpha_output)
         : ogl_(ogl)
         , kernel_(ogl_)
+        , straight_alpha_kernel_(ogl_)
         , max_frame_size_(max_frame_size)
         , depth_(depth)
         , straight_alpha_output_(straight_alpha_output)
     {
+    }
+
+    void set_straight_alpha_output(bool value)
+    {
+        straight_alpha_output_.store(value, std::memory_order_relaxed);
+    }
+
+    bool get_straight_alpha_output() const
+    {
+        return straight_alpha_output_.load(std::memory_order_relaxed);
     }
 
     std::future<std::tuple<array<const std::uint8_t>, std::shared_ptr<core::texture>>>
@@ -110,14 +124,13 @@ class image_renderer
                                  -> std::tuple<std::future<array<const std::uint8_t>>, std::shared_ptr<core::texture>> {
                 auto target_texture = ogl_->create_texture(format_desc.width, format_desc.height, 4, depth_);
 
-                if (straight_alpha_output_) {
-                    auto composited_texture = ogl_->create_texture(format_desc.width, format_desc.height, 4, depth_);
+                if (straight_alpha_output_.load(std::memory_order_relaxed)) {
+                    auto composited_texture =
+                        ogl_->create_texture(format_desc.width, format_desc.height, 4, depth_);
+
                     draw(composited_texture, std::move(layers), format_desc);
-                    draw(target_texture,
-                         std::move(composited_texture),
-                         format_desc,
-                         core::blend_mode::normal,
-                         true);
+
+                    straight_alpha_kernel_.draw(target_texture, composited_texture);
                 } else {
                     draw(target_texture, std::move(layers), format_desc);
                 }
@@ -249,8 +262,7 @@ class image_renderer
     void draw(std::shared_ptr<texture>&  target_texture,
               std::shared_ptr<texture>&& source_texture,
               core::video_format_desc    format_desc,
-              core::blend_mode           blend_mode             = core::blend_mode::normal,
-              bool                       straight_alpha_output = false)
+              core::blend_mode           blend_mode = core::blend_mode::normal)
     {
         if (!source_texture)
             return;
@@ -265,7 +277,6 @@ class image_renderer
         draw_params.blend_mode      = blend_mode;
         draw_params.background      = target_texture;
         draw_params.geometry              = core::frame_geometry::get_default();
-        draw_params.straight_alpha_output = straight_alpha_output;
 
         kernel_.draw(std::move(draw_params));
     }
@@ -293,6 +304,16 @@ struct image_mixer::impl
         , transform_stack_(1)
     {
         CASPAR_LOG(info) << L"Initialized OpenGL Accelerated GPU Image Mixer for channel " << channel_id;
+    }
+
+    void set_straight_alpha_output(bool value)
+    {
+        renderer_.set_straight_alpha_output(value);
+    }
+
+    bool get_straight_alpha_output() const
+    {
+        return renderer_.get_straight_alpha_output();
     }
 
     void update_aspect_ratio(double aspect_ratio) { aspect_ratio_ = aspect_ratio; }
@@ -451,6 +472,17 @@ void image_mixer::push(const core::frame_transform& transform) { impl_->push(tra
 void image_mixer::visit(const core::const_frame& frame) { impl_->visit(frame); }
 void image_mixer::pop() { impl_->pop(); }
 void image_mixer::update_aspect_ratio(double aspect_ratio) { impl_->update_aspect_ratio(aspect_ratio); }
+
+void image_mixer::set_straight_alpha_output(bool value)
+{
+    impl_->set_straight_alpha_output(value);
+}
+
+bool image_mixer::get_straight_alpha_output() const
+{
+    return impl_->get_straight_alpha_output();
+}
+
 std::future<std::tuple<array<const std::uint8_t>, std::shared_ptr<core::texture>>>
 image_mixer::render(const core::video_format_desc& format_desc)
 {
