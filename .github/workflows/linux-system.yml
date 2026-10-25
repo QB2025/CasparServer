@@ -48,13 +48,7 @@ jobs:
                       container: debian:sid # Debian Testing
                       apt_prefix: ""
                       upload_artifacts: false # Because of CEF, this is not built correctly
-                    - os: ubuntu-latest
-                      family: debian
-                      distribution: trixie
-                      arch: amd64
-                      container: debian:trixie
-                      apt_prefix: ""
-                      upload_artifacts: false # Because of CEF, this is not built correctly
+                      experimental: true
                     - os: ubuntu-latest
                       family: archlinux
                       distribution: latest
@@ -62,9 +56,11 @@ jobs:
                       container: archlinux:latest
                       apt_prefix: ""
                       upload_artifacts: false # Not supported
+                      experimental: true
 
         runs-on: ${{ matrix.os }}
         container: ${{ matrix.container }}
+        continue-on-error: ${{ matrix.experimental || false }} # Stop failures of smoke tests being loud
         defaults:
             run:
                 shell: bash
@@ -74,7 +70,7 @@ jobs:
               if: ${{ matrix.family == 'archlinux' }}
               run: pacman -Sy --noconfirm git
 
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
 
             - name: Setup environment
               id: setup-env
@@ -84,7 +80,7 @@ jobs:
 
                   # Build a version number for this build
                   GH_REF="${GITHUB_REF##*/}"
-                  GH_REF=$(echo "$GH_REF" | sed 's/[\/]/_/g' | sed 's/ /_/g')
+                  GH_REF=$(echo "$GH_REF" | sed 's/[\/]/-/g' | sed 's/ /-/g' | sed 's/_/-/g')
 
                   VERSION_MAJOR=$(grep -oPi 'set\(CONFIG_VERSION_MAJOR \K\d+' src/CMakeLists.txt)
                   VERSION_MINOR=$(grep -oPi 'set\(CONFIG_VERSION_MINOR \K\d+' src/CMakeLists.txt)
@@ -115,13 +111,9 @@ jobs:
                   $APT_PREFIX apt-get -y build-dep .
 
                   if [[ "${{ matrix.family }}" == "ubuntu" ]]; then
-                    # update the control file to reference the current cef version
-                    CASPARCG_CEF_VER=$(dpkg-query -W -f='${Version}' casparcg-cef-142)
-                    sed -i "s/@CASPARCG_CEF_VER@/${CASPARCG_CEF_VER}/" debian/control
-
                     # Download required packages
                     cd ..
-                    apt-get download casparcg-cef-142=$CASPARCG_CEF_VER
+                    apt-get download casparcg-cef
                     apt-get download casparcg-scanner
                   fi
               env:

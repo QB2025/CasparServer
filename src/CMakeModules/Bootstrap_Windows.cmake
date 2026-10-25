@@ -91,8 +91,8 @@ add_definitions( -DBOOST_LOCALE_HIDE_AUTO_PTR )
 # FFMPEG
 casparcg_add_external_project(ffmpeg-lib)
 ExternalProject_Add(ffmpeg-lib
-	URL ${CASPARCG_DOWNLOAD_MIRROR}/ffmpeg/ffmpeg-7.0.2-full_build-shared.7z
-	URL_HASH MD5=c5127aeed36a9a86dd3b84346be182f8
+	URL ${CASPARCG_DOWNLOAD_MIRROR}/ffmpeg/ffmpeg-8.1.2-full_build-shared.7z
+	URL_HASH SHA256=cba748035c21ce1431d0823c7a3a711f38616f89f87a265dceddf9b7f6749d2d
 	DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
 	CONFIGURE_COMMAND ""
 	BUILD_COMMAND ""
@@ -102,14 +102,13 @@ ExternalProject_Get_Property(ffmpeg-lib SOURCE_DIR)
 set(FFMPEG_INCLUDE_PATH "${SOURCE_DIR}/include")
 set(FFMPEG_BIN_PATH "${SOURCE_DIR}/bin")
 link_directories("${SOURCE_DIR}/lib")
-casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avcodec-61.dll")
-casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avdevice-61.dll")
-casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avfilter-10.dll")
-casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avformat-61.dll")
-casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avutil-59.dll")
-casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/postproc-58.dll")
-casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/swresample-5.dll")
-casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/swscale-8.dll")
+casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avcodec-62.dll")
+casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avdevice-62.dll")
+casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avfilter-11.dll")
+casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avformat-62.dll")
+casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/avutil-60.dll")
+casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/swresample-6.dll")
+casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/swscale-9.dll")
 # for scanner:
 casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/ffmpeg.exe")
 casparcg_add_runtime_dependency("${FFMPEG_BIN_PATH}/ffprobe.exe")
@@ -238,10 +237,11 @@ casparcg_add_runtime_dependency("${LIBERATION_FONTS_BIN_PATH}/LiberationMono-Reg
 if (ENABLE_HTML)
 	casparcg_add_external_project(cef)
 	ExternalProject_Add(cef
-		URL ${CASPARCG_DOWNLOAD_MIRROR}/cef/cef_binary_142.0.17+g60aac24+chromium-142.0.7444.176_windows64_minimal.tar.bz2
-		URL_HASH SHA256=16c072a44484fe521037c74d03a339a77573b1fc0146cf44cc71e79fd0cc0198
+		URL ${CASPARCG_DOWNLOAD_MIRROR}/cef/cef_binary_150.0.22+gc1a097e+chromium-150.0.7871.256_windows64_minimal.tar.bz2
+		URL_HASH SHA256=a6afba8ee3d1cc9ef64318a734dfeb5ceafc0384a46df2af37b857e7d76c0544
 		DOWNLOAD_DIR ${CASPARCG_DOWNLOAD_CACHE}
-		CMAKE_ARGS -DUSE_SANDBOX=Off -DCEF_RUNTIME_LIBRARY_FLAG=/MD ${EXTERNAL_CMAKE_ARGS}
+		# api_version must match CEF_API_VERSION below
+		CMAKE_ARGS -DUSE_SANDBOX=Off -Dapi_version=15000 -DCEF_RUNTIME_LIBRARY_FLAG=/MD ${EXTERNAL_CMAKE_ARGS}
 		INSTALL_COMMAND ""
 	)
 	ExternalProject_Get_Property(cef SOURCE_DIR)
@@ -249,6 +249,7 @@ if (ENABLE_HTML)
 
     add_library(CEF::CEF INTERFACE IMPORTED)
 	add_dependencies(CEF::CEF cef)
+    target_compile_definitions(CEF::CEF INTERFACE CEF_API_VERSION=15000)
     target_include_directories(CEF::CEF INTERFACE
         "${SOURCE_DIR}"
     )
@@ -278,6 +279,8 @@ if (ENABLE_HTML)
 	casparcg_add_runtime_dependency("${CEF_BIN_PATH}/libcef.dll")
 	casparcg_add_runtime_dependency("${CEF_BIN_PATH}/chrome_elf.dll")
 	casparcg_add_runtime_dependency("${CEF_BIN_PATH}/d3dcompiler_47.dll")
+	casparcg_add_runtime_dependency("${CEF_BIN_PATH}/dxcompiler.dll")
+	casparcg_add_runtime_dependency("${CEF_BIN_PATH}/dxil.dll")
 	casparcg_add_runtime_dependency("${CEF_BIN_PATH}/libEGL.dll")
 	casparcg_add_runtime_dependency("${CEF_BIN_PATH}/libGLESv2.dll")
 	casparcg_add_runtime_dependency("${CEF_BIN_PATH}/vk_swiftshader.dll")
@@ -291,7 +294,10 @@ set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY VS_STARTUP_PROJECT c
 add_definitions(-DUNICODE)
 add_definitions(-D_UNICODE)
 add_definitions(-DCASPAR_SOURCE_PREFIX="${CMAKE_CURRENT_SOURCE_DIR}")
-add_definitions(-D_WIN32_WINNT=0x601)
+add_definitions(-D_WIN32_WINNT=0x0A00) # Minimum windows 10
+
+# TODO: recompile boost to avoid this
+add_compile_definitions(BOOST_USE_WINAPI_VERSION=0x0601)  # Boost ABI: must match prebuilt deps
 
 # ignore boost deprecated headers, as these are often reported inside boost
 add_definitions("-DBOOST_ALLOW_DEPRECATED_HEADERS")
